@@ -1,0 +1,120 @@
+# ============================================================
+# BOSS直聘自动投递 — 配置文件
+# ============================================================
+
+# --- 浏览器设置 ---
+browser:
+  headless: false              # 是否无头模式（首次登录必须 false）
+  data_dir: "./browser_data"   # 浏览器用户数据目录（保存登录状态）
+  kill_edge_on_start: true      # 启动前关闭已有 Edge，避免 browser_data 被占用
+  window_size: [1280, 800]
+  slow_mo: 500                 # 操作间延迟 ms（模拟人类速度）
+
+# --- 登录方式 ---
+# method: "qr"     → 扫码登录（推荐首次）
+# method: "cookie" → 从 cookies.json 加载已保存的 Cookie
+login:
+  method: "qr"
+  cookie_file: "./cookies.json"
+  wait_seconds: 60             # 扫码等待秒数
+
+# --- 简历文件 ---
+resume:
+  # 简历文件夹：自动扫描该目录下所有 .pdf/.docx/.txt 文件（推荐方式）
+  resume_dir: "./resumes"
+  # 手动指定（resume_dir 为空时生效）
+  file_paths: []
+  file_path: ""
+  encoding: "utf-8"
+
+# --- 岗位搜索条件 ---
+search:
+  keywords: ["aigc实习", "大模型应用开发", "LLM工程实习生", "RAG开发工程师", "Agent开发实习生", "Python开发工程师"]
+  city: "杭州"
+  experience: "1-3年"               # 与 filter.max_experience 保持一致；交互选择后会覆盖
+  salary: "10-20k"                   # 空=不限；可选: 3K以下/3-5K/5-10K/10-20K/20-50K/50K以上
+  page_limit: 5                # 最多搜索页数
+  jobs_per_page: 15            # 每页抓取数量
+
+# --- 岗位过滤 ---
+filter:
+  # 标题排除关键词（含以下关键词的岗位跳过）
+  exclude_titles:
+    - "驻场"
+    - "外包"
+    - "外派"
+    - "劳务"
+    - "培训"
+    - "急聘"
+    - "大量招"
+    - "小白"
+    - "普工"
+    - "留学生"
+    - "驻场"
+    - "实施"
+  # 公司排除关键词
+  exclude_companies:
+    - "人力资源"
+    - "劳务派遣"
+    - "外包服务"
+    - "保险"
+    - "理财"
+    - "投资管理"
+    - "融资"
+    - "留学生"
+  # 最低匹配分 (0-100)，低于此分不投递
+  min_match_score: 80
+  # KPI 检测: 岗位被判为刷KPI时是否跳过 (建议开启)
+  skip_kpi: true
+  skip_kpi_score: 70   # KPI 得分 >= 此值跳过
+  # AI 岗位适合度检查：用 DeepSeek 判断岗位是否确实匹配简历（仅 api 模式可用）
+  ai_fit_check: true
+  ai_fit_min_score: 40   # 适合度得分 < 此值跳过
+  # 最高学历限制：要求高于此学历的岗位跳过（留空=不限制）
+  max_education: "本科"
+  # 最高经验限制：要求高于此经验的岗位跳过（留空=不限制）
+  # 可选: 应届生/在校生/1年以内/1-3年/3-5年/...
+  max_experience: "1-3年"
+  # 方案A：只投 BOSS 当前在线的岗位（列表 API bossOnline=true；未知时会打开详情页确认）
+  require_boss_online: false
+  # 方案B：允许的最差 BOSS 活跃等级（空或「不限」= 不限制）
+  # 可选: 刚刚活跃 / 今日活跃 / 3日内活跃 / 本周活跃 / 本月活跃 / 近半年活跃
+  max_boss_inactive: "今日活跃"
+
+# --- 公司风险检测 ---
+# mode: "rule"   → 基于规则的本地检测（免费，但数据有限）
+# mode: "api"    → 调用外部 API（天眼查/企查查，需配置 key）
+risk_check:
+  mode: "api"
+  block_levels: ["high"]   # 仅拦截 high；medium 只记录不跳过
+  api:
+    provider: "deepseek"
+    token: "YOUR_DEEPSEEK_API_KEY"
+  # 规则模式关键词
+  risk_keywords:
+    - "裁员"
+    - "欠薪"
+    - "纠纷"
+    - "失信"
+    - "倒闭"
+    - "跑路"
+    - "骗子"
+    - "皮包"
+
+# --- 投递行为 ---
+submit:
+  # 打招呼语（BOSS限制每天打招呼数量，建议简短）
+  greeting: "您好！我是计算机本科27届应届生，可到岗实习6 个月以上，主攻大模型应用开发，自学pytorch框架、RAG、Agent、Langchain Langrouph等agent框架、多模态Agent、Propmt-Tuning微调、蒸馏等。精通cursor等AI Coding智能体。非常匹配贵司大模型应用开发实习生岗位，希望能获得沟通机会！"
+  send_greeting: true
+  # 每天最大投递数（防止封号）
+  daily_limit: 150
+  # 投递间隔（秒），随机在 [min, max] 之间
+  interval:
+    min: 8
+    max: 20
+
+# --- 输出记录 ---
+output:
+  log_file: "./submit_log.csv"         # 投递日志 CSV
+  record_file: "./apply_record.json"   # 详细投递记录 JSON
+  log_level: "INFO"                    # DEBUG / INFO / WARNING / ERROR

@@ -1,0 +1,39 @@
+# 简历 / 敏感文件
+简历*.pdf
+简历*.docx
+resume.txt
+*.pdf
+!requirements.txt
+
+# 运行时生成 / 本地隐私
+cookies.json
+apply_record.json
+submit_log.csv
+daily_count.json
+deepseek_trace.log
+capture_log.txt
+keywords.json
+config_gui.yaml
+*.pyc
+__pycache__/
+resumes/
+
+# 浏览器数据
+browser_data/
+browser_data_edge/
+
+# 打包产物
+build/
+dist/
+*.spec
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+config.yaml  -ss
