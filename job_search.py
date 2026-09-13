@@ -8,12 +8,13 @@ import re
 import json
 import time
 import random
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit, parse_qs
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 from DrissionPage import Chromium
 from utils import clean_text, random_delay, extract_salary_range, get_logger
+from relevance import keyword_matches, contains_term, normalize, is_skill_label
 
 if TYPE_CHECKING:
     from DrissionPage._pages.chromium_tab import ChromiumTab
@@ -33,6 +34,20 @@ _BOSS_STATUS_LINES = frozenset({
     "在线", "离线", "刚刚活跃", "刚刚在线", "今日活跃",
     "3日内活跃", "本周活跃", "本月活跃", "近半年活跃",
 })
+
+
+def enable_durable_responses(listener):
+    # DrissionPage 4.1.1.4 silently returns '' when getResponseBody loses a
+    # renderer during navigation. Keep captured bodies outside the renderer.
+    driver = getattr(listener, '_driver', None)
+    if driver is not None:
+        try:
+            result = driver.run('Network.configureDurableMessages', maxTotalBufferSize=20000000)
+            if isinstance(result, dict) and 'error' in result:
+                driver.run('Network.enable', maxTotalBufferSize=20000000,
+                           maxResourceBufferSize=5000000, enableDurableMessages=True)
+        except Exception:
+            logger.debug('当前浏览器不支持持久响应缓存，保留普通监听', exc_info=True)
 
 
 def has_job_cards(tab) -> bool:
@@ -78,9 +93,12 @@ def is_boss_security_page(tab, strict: bool = False) -> bool:
         )):
             return True
 
-        # 已有岗位卡片 → 绝不是验证页
-        if has_job_cards(tab):
-            return False
+        if tab.run_js("""
+            return [...document.querySelectorAll(
+                'iframe[src*="captcha"], iframe[src*="security"], .geetest_panel, .nc-container'
+            )].some(e => { const r=e.getBoundingClientRect(); return r.width > 20 && r.height > 20 && getComputedStyle(e).visibility !== 'hidden'; });
+        """):
+            return True
 
         # 首页/城市站不要当成验证页
         if "web/geek" not in url and "security" not in url and "passport" not in url:
@@ -105,58 +123,60 @@ def is_boss_security_page(tab, strict: bool = False) -> bool:
         return False
 
 
-def wait_user_clear_security(tab, logger=None, prompt: str = "") -> bool:
-    """暂停等待用户完成安全验证。返回是否可继续搜索/投递。"""
-    log = logger or get_logger("jobs")
-    for round_i in range(5):
-        on_security = is_boss_security_page(tab, strict=True)
-        print()
-        log.warning("=" * 55)
-        if on_security:
-            log.warning("  ⚠️ 当前在 BOSS 安全验证页 (security.html)")
-            log.warning("     请在浏览器完成滑块/验证码，等页面自动跳走")
-            log.warning("     跳到职位列表后，再回终端按 Enter")
-            log.warning("     （此时输入 y 无效，必须先离开验证页）")
-        else:
-            log.warning("  ⚠️ 需要你在浏览器准备好职位列表")
-            log.warning("     1. 打开 BOSS「职位」页")
-            log.warning("     2. 手动搜索目标关键词，等到左侧出现岗位")
-            log.warning("     3. 回车继续；确认有列表可输入 y")
-        if prompt:
-            log.warning(f"     {prompt}")
-        log.warning("=" * 55)
+def wait_user_clear_security(tab, logger=None, prompt='', timeout=180, ready=None):
+    log = logger or get_logger('jobs')
+    log.info('等待网站登录/校验状态恢复，恢复后程序自动继续。' + prompt)
+    notified = False
+    deadline = time.monotonic() + timeout
+    stable_since = None
+    while time.monotonic() < deadline:
         try:
-            ans = (input("  继续? [Enter/y] ").strip().lower())
-        except EOFError:
-            ans = ""
-        try:
-            tab.wait(1)
+            usable = (not is_boss_security_page(tab, strict=True)
+                      and is_boss_logged_in_visually(tab)
+                      and (ready(tab) if ready is not None else True))
         except Exception:
-            pass
+            usable = False  # Browser navigation can invalidate its JS context briefly.
+        if not usable and not notified and _needs_user_action(tab):
+            log.warning('网站显示登录或验证码，请在浏览器完成这一项；搜索会由程序自动继续。')
+            notified = True
+        if usable:
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 2:
+                return True
+        else:
+            stable_since = None
+        time.sleep(.5)
+    log.warning('网站登录/校验未在限时内恢复，已保留进度。')
+    return False
 
-        if is_boss_security_page(tab, strict=True):
-            log.warning("  ⚠️ 仍在验证页，请先完成验证再按 Enter")
-            continue
-        if has_job_cards(tab) or wait_for_job_cards(tab, timeout=6):
-            log.info("  ✅ 已检测到岗位列表")
+
+def _needs_user_action(tab):
+    """Loading/security redirects alone do not imply an interactive challenge."""
+    try:
+        path = urlsplit(tab.url).path
+        if '/login' in path or ('/passport' in path and 'security' not in path):
             return True
-        if ans in ("y", "yes", "强制", "1"):
-            log.info("  ✅ 用户确认继续（将使用当前页面）")
-            return True
-        if round_i < 4:
-            log.info("  未检测到岗位列表，请在浏览器操作后再试...")
-    return has_job_cards(tab)
+        return bool(tab.run_js("""
+            const visible = e => {
+                const r = e.getBoundingClientRect();
+                return r.width > 20 && r.height > 20 && getComputedStyle(e).visibility !== 'hidden';
+            };
+            return [...document.querySelectorAll('.geetest_panel, .nc-container, iframe[src*="captcha"]')].some(visible)
+                || /请完成安全验证|拖动滑块|滑动验证|请完成验证后继续/.test(document.body?.innerText || '');
+        """))
+    except Exception:
+        return False
 
 
 def has_boss_auth_cookies(browser) -> bool:
     """检查 BOSS 登录 Cookie（wt2 / zp_at）"""
     try:
-        cookies = browser.cookies(all_domains=True)
+        cookies = browser.cookies(all_info=True)
     except TypeError:
         cookies = browser.cookies()
     except Exception:
         return False
-    auth_names = {"wt2", "zp_at", "__zp_stoken__"}
+    auth_names = {"wt2", "zp_at"}
     for c in cookies or []:
         domain = str(c.get("domain") or "")
         if "zhipin.com" not in domain:
@@ -166,125 +186,37 @@ def has_boss_auth_cookies(browser) -> bool:
     return False
 
 
-def is_boss_logged_in_visually(tab, browser=None) -> bool:
-    """通过页面 UI / Cookie 判断求职者是否已登录（不依赖 API）"""
-    if browser and has_boss_auth_cookies(browser):
-        return True
+def is_boss_logged_in_visually(tab, browser=None):
+    """Require visible signed-in navigation; auth/security cookies alone are insufficient."""
     try:
-        hit = tab.run_js("""
-            const body = document.body;
-            if (!body) return false;
-            const text = body.innerText || '';
-            // 求职者登录后顶部有「消息」「简历」
-            if (text.includes('消息') && text.includes('简历')) return true;
-            const sels = [
-                'a[ka="header-my"]', '.nav-user', '.user-nav',
-                '.header-login .user-name', '.label-text .user-name',
-            ];
-            for (const s of sels) {
-                if (document.querySelector(s)) return true;
-            }
-            return false;
-        """)
-        return bool(hit)
+        return bool(tab.run_js("""
+            const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+            const users = [...document.querySelectorAll(
+                'a[ka="header-my"], .nav-figure, .nav-user, .user-nav .avatar, .header-login .user-name'
+            )];
+            if (users.some(e => visible(e) && !/登录|注册/.test(e.innerText || ''))) return true;
+            const nav = [...document.querySelectorAll('header a, #header a, .header a')].filter(visible);
+            return nav.some(e => /消息/.test(e.innerText || '')) &&
+                   nav.some(e => /简历/.test(e.innerText || '')) &&
+                   !nav.some(e => (e.innerText || '').includes('登录'));
+        """))
     except Exception:
         return False
 
 
 def probe_boss_session(tab) -> str:
-    """探测 BOSS 会话：ok / security / login / error"""
-    js = (
-        "fetch('https://www.zhipin.com/wapi/zpgeek/search/joblist.json?"
-        "scene=1&query=test&city=101210100&page=1&pageSize=1',"
-        "{headers:{'x-requested-with':'XMLHttpRequest'}})"
-        ".then(r=>r.text()).catch(e=>'ERR:'+e.message)"
-    )
-    try:
-        resp = tab.run_cdp(
-            "Runtime.evaluate",
-            expression=js,
-            awaitPromise=True,
-            returnByValue=True,
-        )
-        raw = (resp.get("result") or {}).get("value") or ""
-        if not isinstance(raw, str) or not raw.startswith("{"):
-            return "error"
-        data = json.loads(raw)
-        code = data.get("code", -1)
-        if code == 0:
-            return "ok"
-        if code == 37:
-            return "security"
-        if code in (7, 101):
-            return "login"
-        return "error"
-    except Exception:
-        return "error"
+    """Inspect UI without issuing synthetic search requests."""
+    if is_boss_security_page(tab, strict=True):
+        return 'security'
+    return 'ok' if is_boss_logged_in_visually(tab) else 'login'
 
 
-def ensure_boss_api_ready(tab, logger=None, timeout: int = 180) -> bool:
-    """确保 BOSS API 可用。code=37 时引导用户完成验证并轮询。"""
-    log = logger or get_logger("jobs")
-    st = probe_boss_session(tab)
-    if st == "ok":
-        log.info("✅ BOSS API 可用")
-        return True
-
-    log.warning("=" * 55)
-    log.warning("  ⚠️ BOSS 返回「环境存在异常」(code=37)，无法自动开聊/打开详情")
-    log.warning("     这是账号/浏览器风控，不是岗位选择器坏了")
-    log.warning("     请按下面做（必须做完 API 通过才能投递）：")
-    log.warning("     1. 看 Edge 是否有滑块/验证码 → 完成")
-    log.warning("     2. 或手动点顶部「职位」，完成验证直到能正常搜岗位")
-    log.warning("     3. 验证成功后回到终端按 Enter，程序会自动检测")
-    log.warning("=" * 55)
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            # 非阻塞：若用户已在操作，每 3 秒探测一次
-            st = probe_boss_session(tab)
-            if st == "ok":
-                log.info("✅ BOSS API 已恢复，可以自动投递")
-                return True
-            # 去掉 URL 上残留的 _security_check 再试一次加载
-            url = (tab.url or "")
-            if "_security_check=" in url.lower():
-                try:
-                    clean = url.split("?")[0]
-                    if clean:
-                        tab.get(clean)
-                        tab.wait(2)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            ans = input("  API 未通过，完成验证后按 Enter 重试，输入 q 放弃: ").strip().lower()
-        except EOFError:
-            ans = ""
-        if ans == "q":
-            return False
-        st = probe_boss_session(tab)
-        if st == "ok":
-            log.info("✅ BOSS API 已恢复，可以自动投递")
-            return True
-        log.warning(f"  仍未通过 (api={st})，请继续在浏览器完成验证...")
-
-    log.error("❌ 等待超时：API 仍不可用，自动投递无法进行")
-    return False
+def ensure_boss_api_ready(tab, logger=None, timeout=180):
+    return probe_boss_session(tab) == 'ok' or wait_user_clear_security(tab, logger, timeout=timeout)
 
 
-def verify_boss_session(tab) -> bool:
-    """用搜索 API 探测 BOSS 是否已登录且通过安全验证"""
-    status = probe_boss_session(tab)
-    if status == "ok":
-        return True
-    if status == "security":
-        logger.warning("  ⚠️ BOSS 需要安全验证（请在浏览器完成滑块/验证码）")
-    elif status == "login":
-        logger.warning("  ⚠️ BOSS 未登录或会话过期")
-    return False
+def verify_boss_session(tab):
+    return probe_boss_session(tab) == 'ok'
 
 
 def _is_salary(line: str) -> bool:
@@ -311,16 +243,8 @@ def _is_title(line: str) -> bool:
     return True
 
 
-def title_matches_keyword(title: str, keyword: str) -> bool:
-    """判断岗位标题是否与搜索关键词相关（DOM 兜底时用）"""
-    if not title or not keyword:
-        return True
-    t = title.lower()
-    k = keyword.lower()
-    if k in t or t in k:
-        return True
-    parts = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{2,}", k)
-    return any(p.lower() in t for p in parts)
+def title_matches_keyword(title, keyword):
+    return keyword_matches(title, keyword)
 
 
 def _normalize_company(name: str) -> str:
@@ -375,9 +299,9 @@ def _clean_job_url(url: str, keep_query: bool = True) -> str:
     return url
 
 
-def job_url_key(url: str) -> str:
-    """去重用的岗位 URL 主键（去掉 query）"""
-    return _clean_job_url(url, keep_query=False)
+def job_url_key(url):
+    eid = extract_encrypt_job_id(url)
+    return 'job:' + eid if eid else _clean_job_url(url, keep_query=False)
 
 
 def extract_encrypt_job_id(url: str) -> str:
@@ -387,8 +311,8 @@ def extract_encrypt_job_id(url: str) -> str:
     m = re.search(r"/job_detail/([^./?#]+)", url)
     if m:
         return m.group(1)
-    m = re.search(r"[?&]jobId=([^&]+)", url)
-    return m.group(1) if m else ""
+    params = parse_qs(urlsplit(url).query)
+    return str((params.get('jobId') or params.get('encryptJobId') or [''])[0])
 
 
 @dataclass
@@ -412,6 +336,8 @@ class JobPosting:
     boss_active_time: str = ""
     encrypt_job_id: str = ""
     _security_id: str = ""
+    source_keyword: str = ""
+    source: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -425,6 +351,7 @@ class JobPosting:
             "boss_name": self.boss_name,
             "boss_online": self.boss_online,
             "boss_active_time": self.boss_active_time,
+            "source_keyword": self.source_keyword, "source": self.source,
         }
 
 
@@ -434,6 +361,13 @@ class JobSearcher:
         "C", "C++", "Python", "RTOS", "FreeRTOS", "Linux", "ARM", "STM32",
         "单片机", "嵌入式", "驱动", "I2C", "SPI", "UART", "CAN", "TCP/IP",
         "DSP", "FPGA", "ZigBee", "BLE", "Keil", "IAR", "GCC", "Git",
+        "LLM", "大模型", "RAG", "Agent", "智能体", "AIGC", "LangChain", "LangGraph",
+        "PyTorch", "TensorFlow", "FastAPI", "Django", "Java", "Spring", "Go", "React",
+        "Vue", "JavaScript", "TypeScript", "MySQL", "Redis", "Docker", "Kubernetes",
+        "Shell", "Bash", "Ansible", "Jenkins", "Prometheus", "Grafana", "Alertmanager",
+        "Nginx", "Tomcat", "ELK", "Loki", "TiDB", "Ceph", "Terraform", "DevOps",
+        "SRE", "K8s", "CentOS", "Ubuntu", "HAProxy", "Keepalived", "CI/CD",
+        "运维", "运维开发", "自动化运维", "监控告警", "故障排查", "高可用",
     ]
 
     CITY_CODES = {
@@ -460,13 +394,25 @@ class JobSearcher:
         search_cfg = config["search"]
         self.keywords = search_cfg.get("keywords", ["嵌入式"])
         self.city = search_cfg.get("city", "杭州")
-        self.city_code = self.CITY_CODES.get(self.city, self.city)
+        self.city_code = str(search_cfg.get('city_code') or self.CITY_CODES.get(self.city, self.city))
+        if not self.city_code.isdigit():
+            raise ValueError('未知城市，请配置 search.city_code（网站城市数字代码）: ' + str(self.city))
         self.experience = search_cfg.get("experience", "")
         self.exp_code = self.EXPERIENCE_CODES.get(self.experience, "")
         self.page_limit = search_cfg.get("page_limit", 5)
         self.jobs_per_page = search_cfg.get("jobs_per_page", 15)
         self.filter_cfg = config.get("filter", {})
         self._detail_tab = None
+        self.capture_status = ''
+        self.capture_reason = ''
+        self.capture_has_more = None
+        self.capture_page = 0
+
+    def build_search_url(self, keyword):
+        params = {'query': keyword, 'city': self.city_code}
+        if self.exp_code:
+            params['experience'] = self.exp_code
+        return 'https://www.zhipin.com' + self.cfg.get('search', {}).get('path', '/web/geek/jobs') + '?' + urlencode(params)
 
     def close_detail_tab(self):
         if self._detail_tab:
@@ -478,6 +424,11 @@ class JobSearcher:
 
     def ensure_detail_tab(self):
         """获取/创建专用详情标签页（与搜索页隔离，避免首页跳转失败）"""
+        if self._detail_tab is not None:
+            try:
+                _ = self._detail_tab.url
+            except Exception:
+                self._detail_tab = None
         if self._detail_tab is None:
             self._detail_tab = self.browser.new_tab("about:blank")
         return self._detail_tab
@@ -497,389 +448,213 @@ class JobSearcher:
     def verify_session(self, tab) -> bool:
         return verify_boss_session(tab)
 
-    def fetch_jobs_cdp(self, tab, keyword: str, max_pages: int | None = None) -> list[JobPosting]:
-        """在已登录 tab 内用 CDP fetch 拉取搜索 API（比 listen/DOM 更可靠）"""
-        self.ensure_boss_search_context(tab)
-        self._seen_404 = False
-        limit = max_pages or self.page_limit
-        all_jobs: list[JobPosting] = []
-        seen: set[str] = set()
-        security_retried = False
-        for page in range(1, limit + 1):
-            batch = []
-            try:
-                batch = self._fetch_api(keyword, page, tab)
-            except RuntimeError:
-                if not security_retried:
-                    security_retried = True
-                    logger.warning("  ⚠️ BOSS 安全验证：请在浏览器完成滑块/验证码")
-                    logger.info("  验证成功后按 Enter（程序不会自动跳转页面）")
-                    try:
-                        input()
-                    except EOFError:
-                        pass
-                    try:
-                        batch = self._fetch_api(keyword, page, tab)
-                    except RuntimeError:
-                        break
-                else:
-                    break
-            else:
-                security_retried = False
-            if not batch:
-                break
-            for job in batch:
-                if job.url and job.url not in seen:
-                    seen.add(job.url)
-                    _sanitize_job(job)
-                    all_jobs.append(job)
-            if len(batch) < 15:
-                break
-            time.sleep(random.uniform(0.3, 0.8))
-        if all_jobs:
-            logger.info(
-                f"  📡 CDP API: {len(all_jobs)}个 | "
-                f"首岗={all_jobs[0].title[:25]}"
-            )
-        return all_jobs
-
-    # ==================== 卡片查找 ====================
-
-    def _find_card_elements(self, tab) -> list:
-        """查找岗位卡片容器：优先新版布局选择器，回退到链接向上查找"""
-        card_selectors = (
-            ".job-card-wrapper",
-            ".job-card-box",
-            "li.job-card-box",
-            ".rec-job-list li",
-            ".job-list-box .job-card-left",
-            "div[class*='job-card-wrapper']",
-            "div[class*='job-card-box']",
-        )
-        for sel in card_selectors:
-            try:
-                cards = tab.eles(sel)
-                if cards:
-                    logger.info(f"  定位到 {len(cards)} 个卡片 ({sel})")
-                    return cards
-            except Exception:
-                continue
-
-        card_set: set[int] = set()
-        results: list = []
-
-        all_links = tab.eles("tag:a")
-        if not all_links:
-            all_links = tab.eles("a")
-        if not all_links:
-            return results
-
-        for a in all_links:
-            try:
-                href = a.link
-            except Exception:
-                continue
-            if not href or not _JOB_URL_RE.search(str(href)):
-                continue
-            if "/job_detail/" not in str(href):
-                continue
-
-            for level in (2, 3, 4, 5):
-                try:
-                    card = a.parent(level)
-                    if card is None:
-                        continue
-                    cid = id(card)
-                    if cid in card_set:
-                        continue
-                    txt = card.text or ""
-                    if len(txt) < 15 or len(txt) > 2000:
-                        continue
-                    if _GARBAGE_RE.search(txt[:200]):
-                        continue
-                    card_set.add(cid)
-                    results.append(card)
-                    break
-                except Exception:
-                    continue
-
-        if results:
-            logger.info(f"  定位到 {len(results)} 个独立卡片")
-        else:
-            logger.warning("  页面未找到岗位卡片")
-        return results
-
-    # ==================== API 获取（CDP fetch） ====================
-
-    _seen_404 = False
-
-    def _fetch_api(self, keyword: str, page: int, tab) -> list[JobPosting]:
-        """CDP Runtime.evaluate + awaitPromise：在已登录搜索 tab 内执行 fetch()
-
-        关键：fetch() 在页面原生 JS 上下文中运行，100% 继承页面 Cookie/鉴权。
-        不创建新 tab，不会弹出 JSON 页面。
-        """
-        import json as _json
-        from urllib.parse import urlencode, quote as _q
-
-        params = {"scene": "1", "query": keyword, "city": self.city_code,
-                  "page": page, "pageSize": 30}
-        if self.exp_code:
-            params["experience"] = self.exp_code
-        qs = urlencode(params, quote_via=_q)
-        api_url = f"https://www.zhipin.com/wapi/zpgeek/search/joblist.json?{qs}"
-
-        js_code = (
-            f"fetch('{api_url}', {{headers: {{'x-requested-with': 'XMLHttpRequest'}}}})"
-            f".then(r => {{ if (!r.ok) return 'ERR:' + r.status; return r.text(); }})"
-            f".catch(e => 'ERR:' + e.message)"
-        )
-
-        try:
-            resp = tab.run_cdp("Runtime.evaluate",
-                expression=js_code, awaitPromise=True, returnByValue=True)
-        except Exception as e:
-            logger.warning(f"  CDP fetch p{page}: {e}")
-            return []
-
-        result = resp.get("result", {})
-        if result.get("subtype") == "error":
-            logger.warning(f"  CDP fetch p{page} error: {result.get('description','?')[:80]}")
-            return []
-
-        raw = result.get("value", "") or ""
-        if not isinstance(raw, str) or not raw.startswith("{"):
-            if raw and page == 1:
-                logger.warning(f"  CDP 搜索非JSON: {str(raw)[:100]}")
-            return []
-
-        try:
-            data = _json.loads(raw)
-        except Exception:
-            return []
-
-        code = data.get("code", -1)
-        if code == 37:
-            if not self._seen_404:
-                self._seen_404 = True
-            else:
-                raise RuntimeError
-        if code != 0:
-            if code not in (37,):
-                logger.warning(f"  搜索API code={code} msg={data.get('message','')[:60]}")
-            return []
-
-        jl = data.get("zpData", {}).get("jobList", [])
-        return self._jobs_from_list(jl, keyword, page) if jl else []
-
-    def scroll_and_capture(self, tab, keyword: str, max_pages: int = 10) -> list[JobPosting]:
-        """滚动页面触发懒加载，每页用 listen 捕获 SPA 自己的 API 响应"""
-        all_jobs: list[JobPosting] = []
-        seen: set[str] = set()
-
-        for pg in range(1, max_pages + 1):
-            if pg > 1:
-                # 滚动到底部，触发 SPA 懒加载下一页
-                self._scroll_to_bottom(tab)
-                time.sleep(2)
-
-            # 启动监听，等待 SPA 翻页 API 响应
-            try:
-                tab.listen.start('joblist')
-            except Exception:
-                pass
-            try:
-                # 如果是首页，已经加载了，等一下就能捕获
-                # 如果是翻页，scroll 触发了加载
-                ok = tab.listen.wait(timeout=8)
-            except Exception:
-                try: tab.listen.stop()
-                except: pass
-                break
-            try: tab.listen.stop()
-            except: pass
-
-            if not ok:
-                if pg == 1:
-                    continue
-                break
-
-            # 获取匹配的响应体
-            body = None
-            try:
-                steps = tab.listen.steps()
-                if steps:
-                    last = steps[-1]
-                    resp = last.response if hasattr(last, 'response') else last.get('response', {}) if isinstance(last, dict) else {}
-                    if isinstance(resp, dict):
-                        body = resp.get('body', resp)
-                    elif hasattr(resp, 'body'):
-                        body = resp.body
-            except Exception:
-                pass
-            if body is None:
-                if pg == 1:
-                    continue
-                break
-            if isinstance(body, dict):
-                data = body
-            elif isinstance(body, (str, bytes)):
-                import json as _json
-                try:
-                    data = _json.loads(body) if isinstance(body, str) else _json.loads(body.decode("utf-8", errors="replace"))
-                except Exception:
-                    break
-            else:
-                break
-
-            if data.get("code", 0) != 0:
-                break
-
-            jl = data.get("zpData", {}).get("jobList", [])
-            if not jl:
-                break
-
-            added = 0
-            for j in self._jobs_from_list(jl, keyword, pg):
-                if j.url and j.url not in seen:
-                    seen.add(j.url)
-                    all_jobs.append(j)
-                    added += 1
-            logger.info(f"  📡 p{pg}: +{added} (累计{len(all_jobs)})")
-            if not added or len(jl) < 15:
-                break
-            time.sleep(random.uniform(0.5, 1.0))
-
-        return all_jobs
-
     def _scroll_to_bottom(self, tab):
-        """滚动到页面底部，触发懒加载"""
-        try:
-            tab.run_js("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception:
-            pass
-        time.sleep(0.8)
-
-    def inject_fetch_interceptor(self, tab):
-        """通过 CDP 注入 fetch 拦截器（在每次页面加载时自动执行）"""
-        js = """
-        if (!window.__oc_injected) {
-            window.__oc_injected = true;
-            window.__oc_captured = null;
-            var orig = window.fetch;
-            window.fetch = function() {
-                var url = arguments[0] || '';
-                return orig.apply(this, arguments).then(function(r) {
-                    if (typeof url === 'string' && url.indexOf('joblist') > -1) {
-                        r.clone().text().then(function(t) {
-                            window.__oc_captured = t;
-                        }).catch(function(){});
+        tab.run_js("""
+            const nodes = [...document.querySelectorAll(
+                '.job-list-box, .job-list-container, .search-job-result, .job-list, main'
+            )];
+            let scrolled = false;
+            for (const node of nodes) {
+                for (let p = node; p && p !== document.body; p = p.parentElement) {
+                    if (p.scrollHeight > p.clientHeight + 5 && /auto|scroll/.test(getComputedStyle(p).overflowY)) {
+                        p.scrollTop = p.scrollHeight; scrolled = true; break;
                     }
-                    return r;
-                });
-            };
-        }
-        """
-        try:
-            tab.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=js)
-        except Exception:
-            pass
+                }
+            }
+            if (!scrolled) window.scrollTo(0, document.documentElement.scrollHeight);
+        """)
 
-    def get_captured_response(self, tab, keyword: str) -> list[JobPosting]:
-        """获取注入的 fetch 拦截器捕获到的 joblist 响应"""
-        import json as _json
-
-        try:
-            raw = tab.run_js("return window.__oc_captured || ''")
-        except Exception:
-            return []
-
-        if not raw or not isinstance(raw, str) or not raw.startswith("{"):
-            return []
-
-        try:
-            data = _json.loads(raw)
-        except Exception:
-            return []
-
-        if data.get("code", 0) != 0:
-            return []
-
-        jl = data.get("zpData", {}).get("jobList", [])
-        if not jl:
-            return []
-
-        jobs = self._jobs_from_list(jl, keyword, 1)
-        if jobs:
-            logger.info(f"  📡 拦截API: {len(jobs)}个 | 首岗={jobs[0].title[:20]}")
-        return jobs
+    def advance_page(self, tab):
+        for selector in ('css:.options-pages a.next', 'css:.pagination .next',
+                         'css:button[aria-label="下一页"]', 'css:a[rel="next"]'):
+            button = tab.ele(selector, timeout=0)
+            if button and button.states.is_displayed:
+                classes = str(button.attr('class') or '')
+                if 'disabled' in classes or button.attr('disabled') is not None or button.attr('aria-disabled') == 'true':
+                    return False
+                button.click()
+                return True
+        self._scroll_to_bottom(tab)
+        return True
 
     def start_capture(self, tab):
-        """在导航前启动网络监听"""
-        tab.listen.start('joblist')
+        self.capture_status = ''
+        self.capture_reason = ''
+        self.capture_has_more = None
+        self.capture_page = 0
+        tab.listen.start(['/wapi/zpgeek/search/', '/wapi/zpgeek/pc/search/'])
+        enable_durable_responses(tab.listen)
 
-    def wait_capture(self, tab, keyword: str) -> list[JobPosting]:
-        """获取已捕获的搜索 API 响应"""
-        import json as _json
+    @staticmethod
+    def _packet_params(packet):
+        params = {k: v[-1] for k, v in parse_qs(urlsplit(packet.url).query).items()}
+        post = getattr(packet.request, 'postData', None)
+        if isinstance(post, str) and post:
+            try:
+                post = json.loads(post)
+            except ValueError:
+                post = {k: v[-1] for k, v in parse_qs(post).items()}
+        if isinstance(post, dict):
+            params.update(post)
+        return params
 
+    def wait_capture(self, tab, keyword, timeout=None, stop=False):
+        timeout = self.cfg.get('search', {}).get('capture_timeout', 8) if timeout is None else timeout
+        self.capture_status = 'timeout'
+        self.capture_reason = '未在限时内收到匹配关键词与城市的搜索响应'
+        deadline = time.monotonic() + timeout
+        jobs = {}
         try:
-            resp = tab.listen.wait(timeout=8)
-        except Exception:
-            return []
+            while time.monotonic() < deadline:
+                packet = tab.listen.wait(timeout=max(.05, min(deadline-time.monotonic(), .5 if jobs else 2)), raise_err=False)
+                if not packet or isinstance(packet, bool):
+                    if jobs:
+                        break
+                    continue
+                for item in packet if isinstance(packet, list) else [packet]:
+                    try:
+                        params = self._packet_params(item)
+                        if normalize(params.get('query')) != normalize(keyword):
+                            continue
+                        if str(params.get('city', '')) != str(self.city_code):
+                            continue
+                        body = item.response.body
+                        if isinstance(body, bytes):
+                            body = body.decode('utf-8')
+                        if body in ('', None):
+                            self.capture_status = 'unavailable'
+                            self.capture_reason = '无法取得搜索响应正文；不能据此认定没有岗位'
+                            continue
+                        try:
+                            data = json.loads(body) if isinstance(body, str) else body
+                        except ValueError:
+                            self.capture_status = 'invalid_response'
+                            self.capture_reason = '搜索响应不是有效 JSON'
+                            continue
+                        if not isinstance(data, dict):
+                            self.capture_status = 'invalid_response'
+                            self.capture_reason = '搜索响应结构异常'
+                            continue
+                        code = str(data.get('code', ''))
+                        if code != '0':
+                            self.capture_status = {'37': 'security', '7': 'login', '101': 'login'}.get(code, 'error')
+                            self.capture_reason = '搜索接口返回 code=' + code
+                            if code == '37':
+                                self.capture_reason += '（网站判定环境异常）'
+                            logger.warning(self.capture_reason)
+                            return list(jobs.values())
+                        zp = data.get('zpData') or {}
+                        rows = zp.get('jobList')
+                        if not isinstance(rows, list):
+                            continue
+                        self.capture_status = 'ok'
+                        self.capture_reason = ''
+                        page = int(params.get('page') or 1)
+                        if page >= self.capture_page:
+                            self.capture_page = page
+                            more = zp.get('hasMore')
+                            self.capture_has_more = more if isinstance(more, bool) else None
+                        for job in self._jobs_from_list(rows, keyword, page):
+                            jobs[job_url_key(job.url)] = job
+                    except (ValueError, TypeError, AttributeError):
+                        logger.debug('忽略无法解析的搜索响应', exc_info=True)
+                if self.capture_status == 'ok' and not jobs:
+                    break
         finally:
-            try: tab.listen.stop()
-            except: pass
+            if stop:
+                tab.listen.stop()
+        return list(jobs.values())
 
-        # wait() 可能返回 DataPacket 或 bool
-        body = None
-        if resp and not isinstance(resp, bool):
-            try:
-                body = resp.response.body
-            except Exception:
-                pass
-        elif resp:
-            try:
-                steps = tab.listen.steps()
-                if steps and len(steps) > 0:
-                    last = steps[-1]
-                    if hasattr(last, 'response') and hasattr(last.response, 'body'):
-                        body = last.response.body
-            except Exception:
-                pass
-
-        if body is None:
-            return []
-
-        if isinstance(body, dict):
-            data = body
-        elif isinstance(body, bytes):
-            try:
-                data = _json.loads(body.decode("utf-8", errors="replace"))
-            except Exception:
+    def collect_search_results(self, tab, keyword, trigger):
+        results = {}
+        self.start_capture(tab)
+        empty_rounds = 0
+        try:
+            if not trigger(tab, keyword, self):
+                status, reason = self.capture_status, self.capture_reason
+                # A search response may arrive just before a redirect to home/login.
+                self.wait_capture(tab, keyword, timeout=2)
+                if self.capture_status not in ('security', 'login', 'error'):
+                    self.capture_status, self.capture_reason = status, reason
                 return []
-        elif isinstance(body, str):
-            try:
-                data = _json.loads(body)
-            except Exception:
-                return []
-        else:
-            return []
+            for page in range(self.page_limit):
+                # Read the captured response before inspecting a redirected page.
+                batch = self.wait_capture(tab, keyword)
+                if self.capture_status in ('security', 'login', 'error'):
+                    break
+                if is_boss_security_page(tab, strict=True):
+                    self.capture_status = 'security'
+                    self.capture_reason = '搜索进入网站校验页面'
+                    break
+                if not batch and self.capture_status != 'ok' and self._search_context_matches(tab, keyword, check_input=True):
+                    batch = self._parse_page(tab)
+                    for job in batch:
+                        job.source_keyword, job.source = keyword, 'dom'
+                    if batch:
+                        self.capture_status, self.capture_reason = 'ok', ''
+                added = 0
+                for job in batch:
+                    key = job_url_key(job.url)
+                    if not extract_encrypt_job_id(job.url) or key in results:
+                        continue
+                    results[key] = job
+                    added += 1
+                logger.info('搜索「%s」第%d轮: +%d，累计%d', keyword, page+1, added, len(results))
+                empty_rounds = 0 if added else empty_rounds + 1
+                if self.capture_has_more is False or empty_rounds >= 2 or page+1 >= self.page_limit:
+                    break
+                if not self.advance_page(tab):
+                    break
+            return list(results.values())
+        finally:
+            tab.listen.stop()
 
-        if data.get("code", 0) != 0:
-            return []
+    def search_with_recovery(self, tab, keyword, trigger):
+        """Retry the configured search once after recovery, including return to home.
 
-        jl = data.get("zpData", {}).get("jobList", [])
-        if not jl:
-            return []
+        The user never needs to type the keyword or navigate back to search.
+        Actual login/captcha interactions remain in the website's own UI.
+        """
+        results = {}
+        for attempt in range(2):
+            batch = self.collect_search_results(tab, keyword, trigger)
+            results.update((job_url_key(job.url), job) for job in batch)
+            if self.capture_status == 'ok':
+                break
+            if attempt == 1 or self.capture_status == 'error':
+                break
+            logger.info('搜索尚未完成：%s', self.capture_reason or self.capture_status)
+            if self.capture_status in ('security', 'login'):
+                # Homepage is a valid recovery state, but is never a search result.
+                # Reissue the full keyword/city automatically after it becomes stable.
+                if not wait_user_clear_security(tab, logger,
+                        timeout=self.cfg.get('runtime', {}).get('security_wait_seconds', 180)):
+                    break
+            else:
+                time.sleep(self.cfg.get('runtime', {}).get('search_retry_delay', 5))
+            logger.info('自动重新搜索「%s」，城市 %s（恢复重试 1/1）', keyword, self.city)
+        return list(results.values())
 
-        jobs = self._jobs_from_list(jl, keyword, 1)
-        if jobs:
-            logger.info(f"  📡 捕获API: {len(jobs)}个 | 首岗={jobs[0].title[:20]}")
-        return jobs
+    def _search_context_matches(self, tab, keyword, check_input=False):
+        params = parse_qs(urlsplit(tab.url).query)
+        valid = (normalize((params.get('query') or [''])[0]) == normalize(keyword)
+                 and (params.get('city') or [''])[0] == str(self.city_code)
+                 and urlsplit(tab.url).path.rstrip('/') in ('/web/geek/job', '/web/geek/jobs'))
+        if valid and check_input:
+            value = tab.run_js("""
+                const input = [...document.querySelectorAll(
+                    'input[placeholder*="搜索"], input[placeholder*="职位"], input.search-input, .search-input input'
+                )].find(e => e.getClientRects().length);
+                return input ? input.value : null;
+            """)
+            return value is not None and normalize(value) == normalize(keyword)
+        return valid
 
     def _jobs_from_list(self, jl: list, keyword: str, page: int) -> list[JobPosting]:
         jobs = []
         for j in (jl or []):
+            if not isinstance(j, dict):
+                continue
             job = JobPosting()
             job.title = j.get("jobName", "")
             job.company = j.get("brandName", "")
@@ -890,281 +665,68 @@ class JobSearcher:
             job.education = j.get("jobDegree", "")
             job.boss_name = j.get("bossName", "")
             if "bossOnline" in j:
-                job.boss_online = bool(j.get("bossOnline"))
+                job.boss_online = j.get("bossOnline") in (True, 1, "true", "1") if j.get("bossOnline") is not None else None
             job.company_size = j.get("brandScaleName", "")
             job.company_industry = j.get("brandIndustry", "")
             job.description = j.get("itemDescription", "") or ""
             eid = j.get("encryptJobId") or j.get("jobId") or ""
             job.encrypt_job_id = eid
-            job._security_id = j.get("securityId") or j.get("encryptBossId") or ""
-            job.url = _clean_job_url(
-                f"https://www.zhipin.com/job_detail/{eid}.html" if eid else f"zhipin://{job.title}|{job.company}"
-            )
-            tags = j.get("jobLabels") or j.get("skills") or []
-            job.skills_required = tags[:8] if tags else []
+            job._security_id = j.get("securityId") or ""
+            job.source_keyword, job.source = keyword, "network"
+            job.boss_active_time = str(j.get("bossActiveTime") or j.get("activeTimeDesc") or "")
+            if not eid:
+                continue
+            query = {k: j[k] for k in ('lid', 'securityId') if j.get(k)}
+            link = j.get('jobUrl') or f'https://www.zhipin.com/job_detail/{eid}.html'
+            job.url = _clean_job_url(link)
+            if query and '?' not in job.url:
+                job.url += '?' + urlencode(query)
+            tags = []
+            for values in (j.get('jobLabels'), j.get('skills')):
+                if isinstance(values, str):
+                    tags.append(values)
+                elif isinstance(values, list):
+                    tags.extend(values)
+            job.tags = [str(t) for t in tags if isinstance(t, (str, int))]
+            job.skills_required = list(dict.fromkeys(
+                [tag for tag in job.tags if is_skill_label(tag)]
+                + self._extract_skills(job.title + ' ' + job.description)))
             if job.title:
                 _sanitize_job(job)
                 jobs.append(job)
         logger.info(f"  API p{page}: {len(jobs)}个 | 首岗={jobs[0].title[:25] if jobs else '?'}")
         return jobs
 
-    def extract_from_js_state(self, tab) -> list[JobPosting]:
-        """从页面 JS 全局状态提取 BOSS SPA 已渲染的岗位数据（最可靠）"""
-        import json as _json
-
-        js_code = """
-        (function() {
-            function findJobs(obj, depth) {
-                if (!obj || typeof obj !== 'object' || depth > 5) return null;
-                // 直接匹配: 数组中包含 jobName/encryptJobId 对象
-                if (Array.isArray(obj) && obj.length > 0 &&
-                    obj[0] && typeof obj[0] === 'object' &&
-                    (obj[0].jobName || obj[0].encryptJobId)) {
-                    return obj;
-                }
-                // 匹配常见的 jobList 字段名
-                var knownKeys = ['jobList','joblist','resultList','list','dataList',
-                    'recommendList','searchResultList','jobCardList','cards'];
-                for (var i = 0; i < knownKeys.length; i++) {
-                    if (obj[knownKeys[i]] && Array.isArray(obj[knownKeys[i]]) &&
-                        obj[knownKeys[i]].length > 0) {
-                        return obj[knownKeys[i]];
-                    }
-                }
-                for (var k in obj) {
-                    if (k === 'length' || k === 'constructor' || k === 'prototype') continue;
-                    try {
-                        var r = findJobs(obj[k], depth + 1);
-                        if (r) return r;
-                    } catch(e) {}
-                }
-                return null;
-            }
-            var result = findJobs(window, 0);
-            return result ? JSON.stringify(result.slice(0, 100)) : '';
-        })()
-        """
-        try:
-            raw = tab.run_js(js_code)
-            if not raw or not isinstance(raw, str) or not raw.startswith("["):
-                return []
-            data = _json.loads(raw)
-            if not data:
-                return []
-            jobs = self._jobs_from_list(data, "_js_", 0)
-            if jobs:
-                logger.info(f"  JS状态提取: {len(jobs)} 个岗位 | 首岗={jobs[0].title[:25]}")
-            return jobs
-        except Exception as e:
-            logger.debug(f"  JS状态提取失败: {e}")
-            return []
-
-    def _parse_page(self, tab) -> list[JobPosting]:
-        cards = self._find_card_elements(tab)
-        if not cards:
-            return []
-
-        jobs = []
-        seen_urls: set[str] = set()
-        for i, card in enumerate(cards):
-            try:
-                job = self._parse_card(card)
-                if not job or not job.title:
-                    continue
-                # 过滤UI导航元素
-                if job.title in ("职位", "职位搜索", "首页", "企业服务", "消息", "我的"):
-                    continue
-                if job.url and job.url in seen_urls:
-                    continue
-                if job.url:
-                    seen_urls.add(job.url)
-                if not job.company:
-                    job.company = "未知公司"
-                    # DEBUG: 输出第一张无公司名的卡片原始文本
-                    if i == 0 and cards[0].text:
-                        raw = cards[0].text[:400].replace("\n", "⏎")
-                        logger.info(f"  🔍 首卡文本: {raw}")
-                _sanitize_job(job)
-                jobs.append(job)
-            except Exception:
+    def _parse_page(self, tab):
+        """Read structured card fields in one browser call; never guess company from salary lines."""
+        rows = tab.run_js("""
+            const cards = [...document.querySelectorAll('.job-card-wrapper, .job-card-box')];
+            const text = (card, selector) => (card.querySelector(selector)?.innerText || '').trim();
+            return cards.filter(c => c.getClientRects().length).map(card => ({
+                url: card.querySelector('a[href*="job_detail"]')?.href ||
+                     (card.matches('a[href*="job_detail"]') ? card.href : ''),
+                title: text(card, '.job-name, .job-title, .job-info .name'),
+                company: text(card, '.company-name, .company-text .name, .company-info .name'),
+                salary: text(card, '.salary, .job-salary'),
+                location: text(card, '.job-area, .job-location, .job-area-wrapper'),
+                tags: [...card.querySelectorAll('.tag-list li, .job-info .tag, .job-card-footer .tag')]
+                    .map(e => e.innerText.trim()).filter(Boolean)
+            }));
+        """) or []
+        jobs = {}
+        for row in rows:
+            if not isinstance(row, dict) or not row.get('title') or not extract_encrypt_job_id(row.get('url', '')):
                 continue
-        return jobs
-
-    def _parse_card(self, card) -> Optional[JobPosting]:
-        job = JobPosting()
-
-        try:
-            text = card.text
-        except Exception:
-            return None
-        if not text or len(text) < 10:
-            return None
-        if _GARBAGE_RE.search(text[:100]):
-            return None
-
-        # ==== 一次性收集所有 a 标签信息，避免反复遍历 ====
-        all_as = card.eles("tag:a") or []
-        company_candidates: list[str] = []
-        for a in all_as:
-            try:
-                href = a.link
-            except Exception:
-                continue
-            if not href:
-                continue
-            href_s = str(href)
-            atext = (a.text or "").strip()
-            if _JOB_URL_RE.search(href_s):
-                if not job.url:
-                    job.url = _clean_job_url(
-                        href_s if href_s.startswith("http") else f"https://www.zhipin.com{href_s}"
-                    )
-                if not job.title and _is_title(atext):
-                    job.title = atext
-            if "/gongsi/" in href_s and atext and 2 <= len(atext) <= 50:
-                company_candidates.append(atext)
-            # 有些公司链接可能是 /company/ 格式
-            if "/company/" in href_s and atext and 2 <= len(atext) <= 50:
-                company_candidates.append(atext)
-
-        # ==== 纯文本行解析 ====
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-        # 标题兜底
-        if not job.title:
-            for line in lines:
-                if line in _BOSS_STATUS_LINES:
-                    continue
-                if _is_title(line) and not _is_salary(line):
-                    job.title = line
-                    break
-            if not job.title and lines:
-                for line in lines:
-                    if line not in _BOSS_STATUS_LINES and not _is_salary(line):
-                        job.title = line
-                        break
-
-        # 薪资
-        for line in lines:
-            if _is_salary(line):
-                job.salary = line
-                job.salary_min, job.salary_max = extract_salary_range(line)
-                break
-        if not job.salary:
-            job.salary = "面议"
-
-        # 公司名：优先用 <a> 提取的，其次文本推断
-        if company_candidates:
-            job.company = company_candidates[0]
-        if not job.company:
-            # 文本行中推断公司：找薪资行后第一个像是公司的行
-            passed_salary = False
-            for line in lines:
-                if _is_salary(line): passed_salary = True; continue
-                if passed_salary and _is_company(line) and line != job.title:
-                    job.company = line; break
-            if not job.company:
-                for line in lines:
-                    if line == job.title: continue
-                    if _is_company(line): job.company = line; break
-        if job.company:
-            job.company = _normalize_company(job.company)
-        if job.title:
-            job.title = _normalize_title(job.title)
-        # 校验假公司名
-        if job.company and job.title:
-            _title_kw = ("工程师", "经理", "AI", "Java", "Python", "管培生", "校招", "应届", "开发", "测试", "产品")
-            _comp_kw = ("公司", "有限", "科技", "网络", "集团", "技术", "股份", "企业", "华为", "阿里", "腾讯", "字节", "百度")
-            if any(w in job.company for w in _title_kw) \
-               and not any(w in job.company for w in _comp_kw):
-                job.company = ""
-
-        # 地点/经验/学历
-        for line in lines:
-            if "·" in line or "经验" in line or "应届" in line:
-                for p in line.replace(" ", "").split("·"):
-                    p = p.strip()
-                    if any(c in p for c in self.CITY_CODES):
-                        job.location = p
-                    elif any(w in p for w in ("经验", "应届", "年", "在校")):
-                        job.experience = p
-                    elif any(d in p for d in ("本科", "大专", "硕士", "博士", "学历")):
-                        job.education = p
-            elif any(c in line for c in self.CITY_CODES) and not job.location:
-                job.location = line
-
-        # 技能
-        job.skills_required = self._extract_skills(text + " " + job.title)
-        if job.url and not job.encrypt_job_id:
+            job = JobPosting(title=row['title'], company=row.get('company') or '未知公司',
+                             url=_clean_job_url(row['url']), salary=row.get('salary', ''),
+                             location=row.get('location', ''), tags=row.get('tags', []))
             job.encrypt_job_id = extract_encrypt_job_id(job.url)
-        return job
-
-    # ==================== 滚动 ====================
-
-    def _scroll_page(self, tab):
-        for _ in range(4):
-            try:
-                tab.run_js("window.scrollBy(0, 600)")
-            except Exception:
-                pass
-            time.sleep(0.4)
-
-    # ==================== 搜索入口 ====================
-
-    def search_all(self) -> list[JobPosting]:
-        all_jobs: dict[str, JobPosting] = {}
-        for keyword in self.keywords:
-            jobs = self._search_one(keyword)
-            for job in jobs:
-                key = job.url or (job.title + job.company)
-                if key not in all_jobs:
-                    all_jobs[key] = job
-        return list(all_jobs.values())
-
-    def _search_one(self, keyword: str) -> list[JobPosting]:
-        results = []
-        tab = self.browser.latest_tab
-        url = f"https://www.zhipin.com/web/geek/job?query={quote(keyword)}&city={self.city_code}"
-        if self.exp_code:
-            url += f"&experience={self.exp_code}"
-        tab.get(url)
-        tab.wait(4)
-        self._scroll_page(tab)
-        for _ in range(self.page_limit):
-            tab.wait(2)
-            self._scroll_page(tab)
-            jobs = self._parse_page(tab)
-            if not jobs:
-                break
-            results.extend(jobs)
-        return results
-
-    def collect_visible_jobs(self, tab, page_limit: int = 5) -> list[JobPosting]:
-        """在已触发搜索的页面上滚动懒加载并解析 DOM 卡片（不导航，不调 API）"""
-        if is_boss_security_page(tab, strict=True) and not has_job_cards(tab):
-            logger.warning("  ⚠️ 安全验证中，跳过 DOM 滚动解析（避免页面闪烁）")
-            return []
-        results: list[JobPosting] = []
-        seen_urls: set[str] = set()
-        for pg in range(page_limit):
-            if is_boss_security_page(tab, strict=True) and not has_job_cards(tab):
-                logger.warning("  ⚠️ 解析中触发安全验证，停止滚动")
-                break
-            if pg > 0:
-                tab.wait(1.5)
-            self._scroll_page(tab)
-            tab.wait(1.5)
-            jobs = self._parse_page(tab)
-            added = 0
-            for j in jobs:
-                if j.url and j.url not in seen_urls:
-                    seen_urls.add(j.url)
-                    results.append(j)
-                    added += 1
-            logger.info(f"  DOM p{pg+1}: +{added} (累计{len(results)})")
-            if not added:
-                break
-        return results
+            job.salary_min, job.salary_max = extract_salary_range(job.salary)
+            job.experience = next((t for t in job.tags if re.search(r'年|应届|在校|经验', t)), '')
+            job.education = next((t for t in job.tags if re.search(r'本科|大专|硕士|博士|高中|中专|学历', t)), '')
+            job.skills_required = self._extract_skills(job.title + ' ' + ' '.join(job.tags))
+            jobs[job_url_key(job.url)] = job
+        return list(jobs.values())
 
     def _parse_boss_status(self, tab) -> tuple[Optional[bool], str]:
         """从当前详情页 DOM 读取 BOSS 在线/活跃状态"""
@@ -1198,72 +760,11 @@ class JobSearcher:
         """打开职位详情页，抓取职位描述与 BOSS 活跃状态"""
         return self.fetch_job_detail(tab, job, need_description=True, need_boss_status=True)
 
-    def _page_is_job_detail(self, page_tab, job: JobPosting) -> bool:
-        """确认页面真的是岗位详情/侧栏，避免首页误判 BOSS 在线"""
-        try:
-            url = (page_tab.url or "").lower()
-            if is_boss_security_page(page_tab):
-                return False
-            eid = (job.encrypt_job_id or "").lower()
-            if eid and eid in url and ("job_detail" in url or "jobid=" in url):
-                return True
-            body = page_tab.run_js(
-                "return document.body? document.body.innerText.slice(0,4000) : ''"
-            ) or ""
-            title = (job.title or "")[:8]
-            has_btn = any(k in body for k in ("立即沟通", "免费沟通", "继续沟通", "职位描述", "任职要求"))
-            if has_btn and title and title in body:
-                return True
-            if "job_detail" in url and has_btn:
-                return True
-        except Exception:
-            pass
-        return False
-
-    def open_job_from_list(self, list_tab, job: JobPosting) -> bool:
-        """在列表页点击岗位卡片，打开侧栏/详情（比直接 get URL 更抗风控）"""
-        if not list_tab or is_boss_security_page(list_tab):
+    def _page_is_job_detail(self, page_tab, job):
+        if is_boss_security_page(page_tab, strict=True):
             return False
-        job_id = job.encrypt_job_id or extract_encrypt_job_id(job.url)
-        title = (job.title or "").strip()
-        if not job_id and not title:
-            return False
-        try:
-            import json as _json
-            hit = list_tab.run_js(
-                f"""
-                (() => {{
-                    const jobId = {_json.dumps(job_id or "")};
-                    const title = {_json.dumps(title)};
-                    const nodes = Array.from(document.querySelectorAll(
-                        'a[href*="job_detail"], .job-card-wrapper, .job-card-box, li.job-card-box, [class*="job-card"]'
-                    ));
-                    for (const el of nodes) {{
-                        const href = el.getAttribute('href')
-                            || (el.querySelector && el.querySelector('a[href*="job_detail"]')
-                                ? el.querySelector('a[href*="job_detail"]').getAttribute('href') : '')
-                            || '';
-                        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                        const card = el.closest('.job-card-wrapper,.job-card-box,li,[class*="job-card"]') || el;
-                        if ((jobId && href && href.includes(jobId))
-                            || (title && text.includes(title.slice(0, Math.min(8, title.length))))) {{
-                            card.scrollIntoView({{block:'center'}});
-                            const link = card.querySelector('a[href*="job_detail"]') || card;
-                            link.click();
-                            return true;
-                        }}
-                    }}
-                    return false;
-                }})()
-                """
-            )
-            if not hit:
-                return False
-            list_tab.wait(3)
-            return self._page_is_job_detail(list_tab, job)
-        except Exception as e:
-            logger.debug(f"  列表打开岗位失败: {e}")
-            return False
+        expected = job.encrypt_job_id or extract_encrypt_job_id(job.url)
+        return bool(expected and extract_encrypt_job_id(page_tab.url) == expected)
 
     def fetch_job_detail(
         self,
@@ -1289,23 +790,14 @@ class JobSearcher:
         own_tab = False
         page_for_parse = None
         try:
-            # 优先：列表页点卡片（不触发 URL 风控）
-            if tab and self.open_job_from_list(tab, job):
-                page_for_parse = tab
-                logger.info(f"  📋 列表打开岗位: {job.title[:20]}")
-            else:
-                detail_tab = self.ensure_detail_tab()
-                if job_url:
-                    detail_tab.get(job_url)
-                    detail_tab.wait(4)
-                if self._page_is_job_detail(detail_tab, job):
-                    page_for_parse = detail_tab
-                else:
-                    # URL 被踢回首页时，不要误读「在线」
-                    logger.warning(
-                        f"  ⚠️ 详情页未真正打开 | {(detail_tab.url or '')[:80]}"
-                    )
-                    return job.description if has_desc else ""
+            detail_tab = self.ensure_detail_tab()
+            if not self._page_is_job_detail(detail_tab, job):
+                detail_tab.get(job_url)
+                detail_tab.wait(1)
+            if not self._page_is_job_detail(detail_tab, job):
+                logger.warning('详情身份未确认，保留列表资料: %s', job.title)
+                return job.description if has_desc else ''
+            page_for_parse = detail_tab
 
             if need_boss_status and page_for_parse:
                 online, active_time = self._parse_boss_status(page_for_parse)
@@ -1332,7 +824,7 @@ class JobSearcher:
             desc = ""
             for sel in desc_selectors:
                 try:
-                    el = page.ele(sel, timeout=2)
+                    el = page.ele("css:" + sel, timeout=0)
                     if el:
                         desc = (el.text or "").strip()
                         if len(desc) >= 50:
@@ -1417,4 +909,4 @@ class JobSearcher:
     def _extract_skills(self, text: str) -> list[str]:
         if not text: return []
         lower = text.lower()
-        return [s for s in self.TECH_KEYWORDS if s.lower() in lower]
+        return [s for s in self.TECH_KEYWORDS if contains_term(lower, s)]

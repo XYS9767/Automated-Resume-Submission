@@ -47,412 +47,292 @@ class AutoBossApp:
         self._searcher = None
         self._boss_url_nav_blocked = False
 
-    def run(self, search_only: bool = False, resume_only: bool = False,
-            resume_path: Optional[str] = None):
+    def run(self, search_only=False, resume_only=False, resume_path=None, interactive=False):
+        from collections import Counter
+        from run_queue import RunQueue
+        from relevance import keyword_matches
+        stats = Counter()
+        recorder = None
         try:
-            # 1. 简历解析 — 支持多简历
-            self.logger.info("解析简历...")
-            paths = self._resolve_resume_paths(resume_path)
-            if not paths:
-                raise FileNotFoundError(
-                    "未找到简历文件！\n"
-                    "  请将 PDF/DOCX 简历放入 resumes/ 文件夹后再运行。\n"
-                    "  示例：resumes/运维工程师简历.pdf"
-                )
-            for p in paths:
-                self.logger.info(f"  解析: {p.name}")
-                parser = ResumeParser(str(p))
-                self.resumes.append(parser.parse())
+            if self._stop_requested():
+                return 0
+            cfg = self.config
+            online = cfg.get('resume', {}).get('source') == 'boss_online' and not resume_path
+            if online:
+                from boss_resume import read_online_profile
+                login = BossLogin(cfg)
+                self.browser = login.login()
+                self.work_tab = login.work_tab
+                profile = read_online_profile(self.browser)
+                self.resumes = [profile.resume]
+                cfg['search']['targets'] = profile.targets
+                cfg['search']['keywords'] = list(dict.fromkeys(t['keyword'] for t in profile.targets))
+                first = profile.targets[0]
+                cfg['search'].update(city=first['city'], city_code=first['city_code'], salary=first['salary'])
+                years = profile.resume.declared_experience_years
+                if years is not None:
+                    cfg['filter']['max_experience'] = str(years) + '年'
+                self.logger.info('使用当前 BOSS 在线简历：%s；%d 个岗位/城市组合',
+                                 profile.resume.name, len(profile.targets))
+            else:
+                paths = self._resolve_resume_paths(resume_path)
+                if not paths:
+                    raise FileNotFoundError("请把自己的 PDF/DOCX/TXT 简历放入 resumes 文件夹，再运行。")
+                self.resumes = [ResumeParser(str(path)).parse() for path in paths]
             self._primary_resume = self.resumes[0]
-            # 合并所有简历文本，AI 匹配时使用全部技能
             self._all_resume_text = self._build_combined_resume_text()
             self._validate_resumes()
-            self.logger.info(
-                f"共解析 {len(self.resumes)} 份简历"
-                f"，文本 {len(self._all_resume_text)} 字符"
-                f"，技能 {len(self._primary_resume.skills)} 项"
-            )
             if resume_only:
-                return
-
-            # 2. 确定搜索关键词：上次保存 > AI 推荐 > 配置文件
+                return 0
             cfg = self.config
             filter_cfg = cfg.get("filter", {})
-            config_keywords = cfg["search"]["keywords"]
-            keywords = self._load_or_review_keywords(cfg, filter_cfg, config_keywords)
-
-            # 3. 手动选择工作经验 / 学历筛选
-            max_exp, max_edu = self._configure_filters_interactive(filter_cfg)
-
-            # 4. 登录
-            self.logger.info("登录 BOSS直聘...")
-            login = BossLogin(self.config)
-            self.browser = login.login()
-            self.work_tab = login.work_tab
-
-            # 5. 初始化模块
-            searcher = JobSearcher(self.browser, self.config)
-            self._searcher = searcher
-            # 搜索经验与交互筛选对齐，避免「搜 3-5 年却只收 ≤1-3 年」全被跳过
-            if max_exp:
-                searcher.experience = max_exp
-                searcher.exp_code = searcher.EXPERIENCE_CODES.get(max_exp, "")
-            self.logger.info(
-                f"搜索城市={searcher.city}({searcher.city_code}) | "
-                f"经验条件={searcher.experience or '不限'}"
-                f"{'(' + searcher.exp_code + ')' if searcher.exp_code else ''}"
-            )
-            risk_checker = CompanyRiskChecker(self.config)
+            risk_checker = CompanyRiskChecker(cfg)
+            keywords = list(dict.fromkeys(k.strip() for k in cfg["search"]["keywords"] if k.strip()))
+            if interactive:
+                keywords = self._load_or_review_keywords(cfg, filter_cfg, keywords)
+                max_exp, max_edu = self._configure_filters_interactive(filter_cfg)
+                filter_cfg.update(max_experience=max_exp, max_education=max_edu)
+            elif not keywords:
+                if cfg["search"].get("use_saved_keywords"):
+                    keywords = self._load_saved_keywords() or []
+                if not keywords:
+                    keywords = risk_checker.suggest_search_keywords(self._all_resume_text)
+            if not keywords:
+                raise ValueError("search.keywords 为空且没有可用 AI 推荐，请在 config.yaml 填写目标岗位。")
+            self.logger.info("自动模式 | 城市=%s | 关键词=%s", cfg["search"].get("city"), "、".join(keywords))
+            self.logger.info("匹配门槛=%s；经验上限=%s；BOSS活跃=%s",
+                             filter_cfg.get("min_match_score", 55), filter_cfg.get("max_experience") or "不限",
+                             filter_cfg.get("max_boss_inactive") or "不限")
+            if self.browser is None:
+                login = BossLogin(cfg)
+                self.browser = login.login()
+                self.work_tab = login.work_tab
+            searcher = self._searcher = JobSearcher(self.browser, cfg)
             risk_checker.set_browser(self.browser)
-            self._login_aiqicha(risk_checker)
-
-            # 爱企查完成后：必须先解除 code=37，否则无法开聊/打开详情
-            tab0 = self.work_tab or self.browser.latest_tab
-            if not ensure_boss_api_ready(tab0, self.logger, timeout=300):
-                self.logger.error(
-                    "BOSS API 未解锁，自动投递无法进行。"
-                    "请换网络/隔几小时后再试，或在普通 Edge（非本程序）里确认能正常沟通岗位。"
-                )
-                return
-            self._boss_url_nav_blocked = False
-            # 强制把账号 lastCity 写成配置城市，避免搜索框回落到青岛等默认城
-            self._force_boss_city(tab0, searcher)
-
-            matcher = JobMatcher(self._primary_resume)
-            submitter = JobSubmitter(
-                self.browser, self.config,
-                work_tab=self.work_tab,
-                get_detail_tab=searcher.ensure_detail_tab,
-            )
-            recorder = ApplyRecorder(self.config)
-
-            self.logger.info(f"今日已投 {submitter.get_today_count()}/{submitter.daily_limit}")
-            if submitter.get_today_count() >= submitter.daily_limit:
-                self.logger.warning(f"今日已达上限 {submitter.daily_limit}，退出")
-                return
-
-            # 加载历史成功URL（跨运行去重）
-            old_success = set()
-            for r in recorder._records:
-                if r.get("result") == "投递成功" and r.get("url"):
-                    old_success.add(r["url"])
-            self.logger.info(f"历史已投递 {len(old_success)} 个")
-
-            min_score = filter_cfg.get("min_match_score", 40)
-            skip_kpi = filter_cfg.get("skip_kpi", True)
-            kpi_threshold = filter_cfg.get("skip_kpi_score", 60)
-            exclude_titles = [k.lower() for k in filter_cfg.get("exclude_titles", [])]
-
-            risk_cache: dict[str, RiskResult] = {}
-            risk_cfg = cfg.get("risk_check", {})
-            block_levels = self._parse_risk_block_levels(risk_cfg.get("block_levels", ["high"]))
-
-            ai_fit_check = filter_cfg.get("ai_fit_check", False)
-            ai_fit_min = filter_cfg.get("ai_fit_min_score", 40)
-            require_boss_online = filter_cfg.get("require_boss_online", False)
-            max_boss_rank = parse_max_boss_inactive(filter_cfg.get("max_boss_inactive", ""))
-
-            stats = {"success": 0, "fail": 0, "risk": 0, "kpi": 0, "fit": 0,
-                     "match": 0, "dup": 0, "excl": 0, "already": 0,
-                     "boss_offline": 0, "boss_inactive": 0}
-
-            # ---- 主循环：每个关键词依次全量处理 ----
-            for keyword in keywords:
-                self.logger.info(f"\n{'='*40}")
-                self.logger.info(f"🔍 {keyword}")
-
-                # 每个关键词开始时清除上次捕获记录
-                cap_file = resolve_path("capture_log.txt")
-                cap_file.write_text("", encoding="utf-8")
-
-                # 监听 + 触发搜索（固定使用 BOSS 工作标签页，避免 latest_tab 指到爱企查）
-                tab = self.work_tab or self.browser.latest_tab
-                if not self._trigger_search(tab, keyword, searcher):
-                    self.logger.warning(f"  ⚠️ 搜索触发失败，跳过关键词「{keyword}」")
-                    continue
-
-                all_jobs: list[JobPosting] = []
-                seen = set()
-
-                # 仅明确验证 URL 才停；有卡片则继续
-                if is_boss_security_page(tab, strict=True) and not has_job_cards(tab):
-                    if not wait_user_clear_security(tab, self.logger):
-                        self.logger.warning(f"  ⚠️ 跳过关键词「{keyword}」")
-                        continue
-                    tab = self.work_tab or self.browser.latest_tab
-
-                # 优先 CDP API（最可靠）
-                self.logger.info("  尝试 CDP API 搜索...")
-                if not is_boss_security_page(tab, strict=True):
-                    api_jobs = searcher.fetch_jobs_cdp(tab, keyword)
-                    for j in api_jobs:
-                        if j.url and j.url not in seen:
-                            seen.add(j.url)
-                            all_jobs.append(j)
-                    if all_jobs:
-                        self._save_capture_log(keyword, all_jobs)
-                        self.logger.info(f"  📡 CDP API 共 {len(all_jobs)} 个岗位")
-
-                # 补充：listen 捕获
-                if not all_jobs and not is_boss_security_page(tab, strict=True):
-                    searcher.start_capture(tab)
-                    captured = searcher.wait_capture(tab, keyword)
-                    if captured:
-                        for j in captured:
-                            if j.url and j.url not in seen:
-                                seen.add(j.url)
-                                all_jobs.append(j)
-                        self._save_capture_log(keyword, all_jobs)
-
-                # 翻页：滚动 → 监听 → 捕获
-                if not all_jobs and not is_boss_security_page(tab, strict=True):
-                    for p in range(2, 11):
-                        if is_boss_security_page(tab, strict=True):
-                            break
-                        searcher.start_capture(tab)
-                        searcher._scroll_to_bottom(tab)
-                        time.sleep(2)
-                        more = searcher.wait_capture(tab, keyword)
-                        if not more:
-                            break
-                        added = 0
-                        for j in more:
-                            if j.url and j.url not in seen:
-                                seen.add(j.url)
-                                all_jobs.append(j)
-                                added += 1
-                        self.logger.info(f"  📡 p{p}: +{added} (累计{len(all_jobs)})")
-                        self._save_capture_log(keyword, all_jobs)
-                        if not added or len(more) < 15:
-                            break
-                        time.sleep(random.uniform(0.5, 1.0))
-
-                # 最后兜底 → DOM
-                if not all_jobs:
-                    if is_boss_security_page(tab, strict=True) and not has_job_cards(tab):
-                        self.logger.warning("  ⚠️ 安全验证中，无法 DOM 解析")
-                    else:
-                        if not has_job_cards(tab):
-                            wait_for_job_cards(tab, timeout=8)
-                        self.logger.info("  API/listen 无结果，尝试 DOM 解析...")
-                        dom_jobs = searcher.collect_visible_jobs(tab, page_limit=5)
-                        for j in dom_jobs:
-                            if j.url and j.url not in seen:
-                                if not title_matches_keyword(j.title, keyword):
-                                    continue
-                                seen.add(j.url)
-                                all_jobs.append(j)
-
-                self.logger.info(f"  共 {len(all_jobs)} 个岗位")
-                # 输出前 20 个岗位名称，确认搜索相关性
-                if all_jobs:
-                    self.logger.info(f"  📋 搜索「{keyword}」TOP20:")
-                    for idx, j in enumerate(all_jobs[:20], 1):
-                        self.logger.info(
-                            f"  [{idx:2d}] {j.title[:35]:35s} | {j.salary:12s} | {j.company[:20]}")
-                    if len(all_jobs) > 20:
-                        self.logger.info(f"  ... 还有 {len(all_jobs) - 20} 个")
-
-                self.logger.info(f"  开始投递...")
-
-                # 逐个投递
-                for i, job in enumerate(all_jobs, 1):
+            if cfg.get("risk_check", {}).get("company_lookup", False) and interactive:
+                self._login_aiqicha(risk_checker)
+            matchers = [JobMatcher(resume) for resume in self.resumes]
+            recorder = ApplyRecorder(cfg)
+            queue = RunQueue(cfg, self.resumes)
+            submitter = JobSubmitter(self.browser, cfg, self.work_tab, searcher.ensure_detail_tab)
+            old_success = {job_url_key(r["url"]) for r in recorder._records
+                           if r.get("url") and r.get("result") in ("投递成功", "已投递过", "沟通成功")}
+            handled = set()
+            failures = 0
+            recovery_rounds = 0
+            targets = cfg['search'].get('targets') or [
+                {'keyword': keyword, 'city': searcher.city, 'city_code': searcher.city_code,
+                 'salary': cfg['search'].get('salary', '')} for keyword in keywords]
+            for target in targets:
+                if self._stop_requested():
+                    return 0
+                keyword = target['keyword']
+                searcher.city = target['city']
+                searcher.city_code = str(target.get('city_code') or JobSearcher.CITY_CODES[searcher.city])
+                cfg['search']['salary'] = target.get('salary', '')
+                scope = searcher.city + '｜' + keyword if cfg['search'].get('targets') else keyword
+                self.logger.info('开始处理：%s / %s', searcher.city, keyword)
+                prior = queue.get(scope)
+                jobs = prior
+                # Resume unfinished jobs first; new searches are deduplicated against them.
+                for attempt in range(2):
+                    try:
+                        fresh = searcher.search_with_recovery(self.work_tab, keyword, self._trigger_search)
+                        queue.add(scope, fresh)
+                        jobs = queue.get(scope)
+                        if searcher.capture_status != "ok":
+                            self.logger.warning("自动搜索暂停：%s；未处理岗位已保存。", searcher.capture_reason or searcher.capture_status)
+                            stats["search_error"] += 1
+                            return 2
+                        break
+                    except Exception as exc:
+                        self.logger.warning("搜索失败 (%s)，尝试恢复标签页", type(exc).__name__)
+                        if attempt == 0:
+                            self.work_tab = self._recover_work_tab()
+                            if self.work_tab:
+                                submitter.work_tab = self.work_tab
+                                continue
+                        stats["search_error"] += 1
+                if not jobs:
+                    self.logger.info('「%s」在当前条件下没有找到岗位。', keyword)
+                    stats['empty_search'] += 1
+                self._save_capture_log(keyword, jobs)
+                stats["captured"] += len(jobs)
+                for job in jobs:
+                    if self._stop_requested():
+                        return 0
                     _sanitize_job(job)
-                    title_lower = job.title.lower()
-
-                    # 跳过历史已投递
-                    if job.url in old_success:
-                        stats["dup"] += 1
-                        self.logger.info(f"  ⏭️ 已投过: {job.title[:30]}")
+                    key = job_url_key(job.url)
+                    if key in old_success or key in handled:
+                        stats["duplicate"] += 1
+                        queue.done(scope, job)
                         continue
-
-                    # 标题过滤（排除关键词）
-                    if any(k in title_lower for k in exclude_titles):
-                        stats["excl"] += 1
-                        continue
-
-                    # 城市过滤（配置杭州时跳过明确标青岛等其它城市的岗位）
-                    if self._job_wrong_city(job, searcher.city):
-                        stats["excl"] += 1
-                        loc = (getattr(job, "location", "") or "")[:20]
-                        self.logger.info(f"  🌏 城市不符({loc or '非'+searcher.city}): {job.title[:30]}")
-                        continue
-
-                    # 学历过滤
-                    if max_edu:
-                        edu = (job.education or "").strip()
-                        if not edu:
-                            edu = job.title or ""
-                        if self._education_too_high(edu, max_edu):
-                            stats["excl"] += 1
-                            self.logger.info(f"  🎓 学历不符({edu[:20]}): {job.title[:30]}")
+                    try:
+                        decision = self._evaluate_job(job, keyword, searcher, risk_checker, matchers)
+                        result, reason, match, risk, score, resume_name = decision
+                        if result:
+                            recorder.record(job, match, risk, result, reason=reason, score=score, resume_name=resume_name)
+                            stats[result] += 1
+                            # A mismatch on this keyword can still fit a later keyword.
+                            queue.done(scope, job)
                             continue
-
-                    # 经验过滤
-                    if self._experience_too_high(job, max_exp):
-                        stats["excl"] += 1
-                        self.logger.info(f"  ⏳ 经验不符({job.experience[:15]}): {job.title[:30]}")
-                        continue
-
-                    # 技能过滤：Java 相关一律跳过
-                    if self._is_java_job(job):
-                        stats["excl"] += 1
-                        self.logger.info(f"  ☕ Java跳过: {job.title[:30]}")
-                        continue
-
-                    # 方案A：列表 API 已明确 BOSS 离线
-                    if require_boss_online and job.boss_online is False:
-                        stats["boss_offline"] += 1
-                        self.logger.info(f"  👤 BOSS离线: {job.title[:30]}")
-                        continue
-
-                    need_desc = ai_fit_check and (not job.description or len(job.description) < 30)
-                    need_boss = require_boss_online or max_boss_rank is not None
-                    if need_desc or (need_boss and self._needs_boss_detail(job, require_boss_online)):
-                        searcher.fetch_job_detail(
-                            tab, job,
-                            need_description=need_desc,
-                            need_boss_status=need_boss,
-                        )
-
-                    if require_boss_online and job.boss_online is not True:
-                        stats["boss_offline"] += 1
-                        label = job.boss_active_time or "离线/未知"
-                        self.logger.info(f"  👤 BOSS未在线({label}): {job.title[:30]}")
-                        continue
-
-                    if max_boss_rank is not None and not self._boss_active_ok(job, max_boss_rank):
-                        # 详情被风控打不开时活跃度未知：放行，避免全部误杀
-                        if not job.boss_active_time and job.boss_online is not True:
-                            self.logger.info(
-                                f"  👤 BOSS活跃度未知(详情未打开)，放行: {job.title[:30]}"
-                            )
+                        if search_only:
+                            recorder.record(job, match, risk, "预览通过", reason="满足配置条件", score=score, resume_name=resume_name)
+                            stats["preview"] += 1
+                            handled.add(key)
+                            # Preview does not remove eligible jobs from the submission queue.
+                            continue
+                        if self._stop_requested():
+                            return 0
+                        result = submitter.submit(job, score)
+                        if result in (SubmitResult.LOGIN_REQUIRED, SubmitResult.SECURITY_REQUIRED):
+                            recorder.record(job, match, risk, result, reason=submitter.last_reason, score=score, resume_name=resume_name)
+                            page = searcher.ensure_detail_tab()
+                            if wait_user_clear_security(page, self.logger,
+                                    timeout=cfg.get("runtime", {}).get("security_wait_seconds", 180),
+                                    ready=lambda page: submitter._tab_has_job(page, job.encrypt_job_id)):
+                                result = submitter.submit(job, score)
+                            else:
+                                return 2
+                        recorder.record(job, match, risk, result, reason=submitter.last_reason,
+                                        score=score, resume_name=resume_name, details=submitter.last_details)
+                        stats[result] += 1
+                        if result == SubmitResult.DAILY_LIMIT:
+                            self.logger.warning("已到本地/平台沟通上限，剩余岗位已保存。")
+                            return 0
+                        if result in (SubmitResult.LOGIN_REQUIRED, SubmitResult.SECURITY_REQUIRED):
+                            return 2
+                        if result in (SubmitResult.SUCCESS, SubmitResult.ALREADY_APPLIED):
+                            old_success.add(key)
+                            handled.add(key)
+                            queue.done(scope, job)
+                            failures = 0
+                            if submitter.get_today_count() >= submitter.daily_limit:
+                                self.logger.info('已达到本次配置的每日上限，剩余岗位保存完成。')
+                                return 0
+                        elif result == SubmitResult.UNCONFIRMED:
+                            handled.add(key)
+                            queue.done(scope, job)  # Kept in durable submission ledger for review.
+                            failures += 1
                         else:
-                            stats["boss_inactive"] += 1
-                            label = job.boss_active_time or "未知"
-                            self.logger.info(f"  👤 BOSS不活跃({label}): {job.title[:30]}")
-                            continue
-
-                    # 公司风险（缓存同一公司避免重复调 API）
-                    risk = None
-                    if job.company != "未知公司":
-                        risk = risk_cache.get(job.company) or risk_checker.check(job.company, job.to_dict())
-                        risk_cache[job.company] = risk
-                    if risk and risk.level in block_levels:
-                        recorder.record(job, None, risk, SubmitResult.RISK_REJECTED)
-                        stats["risk"] += 1
-                        self.logger.info(
-                            f"  ⛔ 风险跳过 [{risk.level.value}/{risk.score}]: "
-                            f"{job.company[:20]} | {'; '.join(risk.reasons[:1])}"
-                        )
-                        continue
-
-                    # KPI
-                    if skip_kpi:
-                        kpi = risk_checker.check_kpi(job.to_dict(), job.company)
-                        if kpi.score >= kpi_threshold:
-                            recorder.record(job, None, None, SubmitResult.KPI_REJECTED)
-                            stats["kpi"] += 1
-                            continue
-
-                    # 岗位匹配：AI 模式实时分析简历 → 规则模式关键词打分
-                    score = 0
-                    match = None
-                    if ai_fit_check and self.resumes:
-                        ai = risk_checker.match_job(self._all_resume_text, job.to_dict())
-                        if ai is not None:
-                            score = ai["score"]
-                            reasons_text = " ".join(ai.get("reasons", []))
-                            no_context = (
-                                score == 0
-                                and (
-                                    "描述为空" in reasons_text
-                                    or "无具体描述" in reasons_text
-                                    or "无任何岗位描述" in reasons_text
-                                )
-                            )
-                            if no_context and not (job.description or "").strip():
-                                match = matcher.match(job)
-                                score = match.total_score
-                                self.logger.info(
-                                    f"  📋 无JD，规则匹配 score={score:.0f}: {job.title[:30]}"
-                                )
-                                if not search_only and score < min_score:
-                                    recorder.record(job, match, None, SubmitResult.MATCH_LOW)
-                                    stats["match"] += 1
-                                    continue
-                            elif not ai["fit"] or score < ai_fit_min:
-                                stats["fit"] += 1
-                                self.logger.info(
-                                    f"  🎯 AI不匹配(score={score}): "
-                                    f"{'; '.join(ai.get('reasons', [])[:2])[:60]}"
-                                )
-                                continue
-                        else:
-                            # AI 失败回退到规则匹配
-                            match = matcher.match(job)
-                            score = match.total_score
-                            if not search_only and score < min_score:
-                                recorder.record(job, match, None, SubmitResult.MATCH_LOW)
-                                stats["match"] += 1
-                                continue
-                    else:
-                        # 规则匹配
-                        match = matcher.match(job)
-                        score = match.total_score
-                        if not search_only and score < min_score:
-                            recorder.record(job, match, None, SubmitResult.MATCH_LOW)
-                            stats["match"] += 1
-                            continue
-
-                    if search_only:
-                        risk_label = risk.level.value if risk else "skip"
-                        self.logger.info(
-                            f"  [{i}] {job.title[:30]} | "
-                            f"{job.salary} | 匹配{score:.0f} | 风险{risk_label}"
-                        )
-                        continue
-
-                    # 投递
-                    self.logger.info(
-                        f"  🚀 [{i}/{len(all_jobs)}] {job.title[:35]} 匹配{score:.0f}"
-                    )
-                    result = submitter.submit(job, score)
-                    recorder.record(job, match, None, result)
-                    recorder.save_json()
-
-                    if result == SubmitResult.SUCCESS:
-                        old_success.add(job.url)
-                        stats["success"] += 1
-                        d = random.uniform(*[cfg["submit"]["interval"][k] for k in ("min", "max")])
-                        self.logger.info(f"  ✅ 等待 {d:.0f}s")
-                        time.sleep(d)
-                    elif result == SubmitResult.DAILY_LIMIT:
-                        self.logger.warning("⚠️ 已达每日投递上限，退出")
-                        recorder.save_json()
-                        self._print_stats(stats)
-                        return
-                    elif result == SubmitResult.ALREADY_APPLIED:
-                        old_success.add(job.url)
-                        stats["already"] += 1
-                    else:
-                        stats["fail"] += 1
-
-            # 汇总
-            self._print_stats(stats)
-            recorder.save_json()
-
+                            failures += 1
+                        if failures >= cfg.get("runtime", {}).get("max_consecutive_failures", 5):
+                            if recovery_rounds >= cfg.get("runtime", {}).get("recovery_rounds", 2):
+                                self.logger.warning("连续失败，已保存剩余队列。请查看 apply_record.json 的具体原因。")
+                                return 2
+                            delay = cfg.get("runtime", {}).get("recovery_cooldown", 30)
+                            self.logger.warning("连续失败，等待 %s 秒后重建详情标签继续。", delay)
+                            time.sleep(delay)
+                            searcher.close_detail_tab()
+                            failures = 0
+                            recovery_rounds += 1
+                        if result != SubmitResult.ALREADY_APPLIED:
+                            interval = cfg.get("submit", {}).get("interval", {"min": 8, "max": 20})
+                            time.sleep(random.uniform(interval["min"], interval["max"]))
+                    except Exception as exc:
+                        self.logger.exception("单岗处理失败，保留待重试: %s", job.title)
+                        recorder.record(job, submit_result=SubmitResult.FAILED,
+                                        reason=f"{type(exc).__name__}: {exc}"[:300])
+                        stats["job_error"] += 1
+                        # Keep queue entry, continue other jobs rather than abort entire run.
+            return 0
         except KeyboardInterrupt:
-            self.logger.warning("用户中断")
+            self.logger.warning("已停止；已完成记录和未完成队列保留，下次运行自动续接。")
+            return 130
         finally:
+            if recorder:
+                recorder.save_json()
+            if stats:
+                self.logger.info("本次统计: %s", dict(stats))
+                from utils import safe_save_json
+                safe_save_json({"stats": dict(stats), "time": datetime.now().isoformat()},
+                               self.config.get("output", {}).get("summary_file", "last_run_summary.json"))
             if self.browser:
                 try:
-                    if getattr(self, "_searcher", None):
-                        self._searcher.close_detail_tab()
+                    self._searcher.close_detail_tab() if self._searcher else None
+                    if not self.config.get("browser", {}).get("keep_open", True):
+                        self.browser.quit()
                 except Exception:
                     pass
-                try: self.browser.quit()
-                except: pass
+
+    def _stop_requested(self):
+        if resolve_path('stop_requested.flag').exists():
+            self.logger.info('收到停止请求；进度已保存。双击启动.bat 可继续。')
+            return True
+        return False
+
+    def _evaluate_job(self, job, keyword, searcher, risk_checker, matchers):
+        from relevance import keyword_matches, contains_term
+        from utils import extract_salary_range
+        f = self.config.get("filter", {})
+        def reject(reason, result="条件不符"):
+            return result, reason, None, None, None, ""
+        if any(contains_term(job.title, k) for k in f.get("exclude_titles", [])):
+            return reject("标题命中排除词")
+        if any(contains_term(job.company, k) for k in f.get("exclude_companies", [])):
+            return reject("公司命中排除词")
+        if self._job_wrong_city(job, searcher.city):
+            return reject("工作地点与配置城市不符: " + job.location)
+        if f.get("max_education") and self._education_too_high(job.education, f["max_education"]):
+            return reject("学历要求超过配置上限: " + job.education)
+        if f.get("max_experience") and self._experience_too_high(job, f["max_experience"]):
+            return reject("经验要求超过配置上限: " + job.experience)
+        if f.get("job_type") == "internship" and not any(w in job.title + job.experience for w in ("实习", "在校")):
+            return reject("仅选择实习岗位")
+        if f.get('job_type') == 'fulltime' and any(w in job.title + job.experience for w in ('实习', '在校', '兼职')):
+            return reject('在线简历只选择全职岗位')
+        need_relevance = not keyword_matches(job.title, keyword, job.description, job.skills_required)
+        need_desc = len(job.description or "") < 30
+        need_boss = bool(f.get("require_boss_online") or f.get("max_boss_inactive"))
+        if need_relevance or need_desc or (need_boss and self._needs_boss_detail(job, f.get("require_boss_online"))):
+            searcher.fetch_job_detail(self.work_tab, job, need_description=True, need_boss_status=need_boss)
+        if not keyword_matches(job.title, keyword, job.description, job.skills_required):
+            return reject("标题/JD/技能均不符合搜索方向: " + keyword, "方向不符")
+        if f.get("require_description", False) and len(job.description or "") < 30:
+            return reject("缺少可核实岗位描述", "资料不足")
+        # Unit-aware salary filter: monthly band must not reject daily-paid internships.
+        salary_filter = self.config.get("search", {}).get("salary", "")
+        if salary_filter and "/天" not in job.salary and "元/日" not in job.salary:
+            lo, hi = extract_salary_range(salary_filter)
+            if lo and hi and job.salary_min and job.salary_max:
+                if job.salary_max < lo or job.salary_min > hi:
+                    return reject("月薪与配置区间无交集: " + job.salary)
+        if f.get("require_boss_online") and job.boss_online is not True:
+            return reject("BOSS未确认在线", "BOSS不在线")
+        max_rank = parse_max_boss_inactive(f.get("max_boss_inactive", ""))
+        if max_rank is not None and not self._boss_active_ok(job, max_rank):
+            if job.boss_active_time or f.get("unknown_boss_activity", "allow") == "skip":
+                return reject("BOSS活跃度不符: " + (job.boss_active_time or "未知"), "BOSS不活跃")
+        risk = risk_checker.check(job.company, job.to_dict())
+        blocked = self._parse_risk_block_levels(self.config.get("risk_check", {}).get("block_levels", ["high"]))
+        if risk.level in blocked:
+            return SubmitResult.RISK_REJECTED, "; ".join(risk.reasons), None, risk, None, ""
+        if f.get("skip_kpi", True):
+            kpi = risk_checker.check_kpi(job.to_dict(), job.company)
+            if kpi.score >= f.get("skip_kpi_score", 70):
+                return SubmitResult.KPI_REJECTED, "; ".join(kpi.reasons), None, risk, None, ""
+        # Match primary title requirements per resume before comparing scores.
+        eligible_matchers = [m for m in matchers if not f.get('require_title_skills', True)
+                             or not m.missing_title_skills(job)]
+        if not eligible_matchers:
+            missing = min((m.missing_title_skills(job) for m in matchers), key=len)
+            return reject('简历缺少职位标题明确要求的技能: ' + '、'.join(missing), '方向不符')
+        # Pick one complete resume instead of combining unrelated skills across files.
+        candidates = [(m.match(job), m.resume) for m in eligible_matchers]
+        match, resume = max(candidates, key=lambda item: item[0].total_score)
+        score = match.total_score
+        reason = "规则匹配"
+        if f.get("ai_fit_check") and risk_checker.ai_available:
+            ai = risk_checker.match_job(resume.raw_text, job.to_dict())
+            if ai is not None:
+                score = ai["score"]
+                reason = "; ".join(ai.get("reasons", []))
+                if not ai["fit"] or score < f.get("ai_fit_min_score", 40):
+                    return SubmitResult.MATCH_LOW, reason, match, risk, score, resume.parsed_from
+                return None, reason, match, risk, score, resume.parsed_from
+        if score < f.get("min_match_score", 55):
+            return SubmitResult.MATCH_LOW, f"规则匹配 {score:.1f} < {f.get('min_match_score', 55)}", match, risk, score, resume.parsed_from
+        return None, reason, match, risk, score, resume.parsed_from
 
     @staticmethod
     def _parse_risk_block_levels(levels) -> set:
@@ -490,8 +370,8 @@ class AutoBossApp:
         return rank <= max_rank
 
     _EDU_RANKS = {"学历不限":0,"不限":0,"高中":1,"中专":2,"大专":3,
-                  "本科":4,"学士":4,"硕士":5,"研究生":5,"研":5,"硕":5,
-                  "博士":6,"博":6,"博士后":6}
+                  "本科":4,"学士":4,"硕士":5,"研究生":5,
+                  "博士":6,"博士后":6}
 
     @classmethod
     def _education_too_high(cls, job_edu: str, max_edu: str) -> bool:
@@ -513,15 +393,8 @@ class AutoBossApp:
         text = text.replace("javascript", "")  # JS 不是 Java
         return any(kw in text for kw in cls._JAVA_FILTER)
 
-    def _build_search_url(self, keyword: str, searcher) -> str:
-        from urllib.parse import quote as _quote
-        url = (
-            f"https://www.zhipin.com/web/geek/jobs?"
-            f"query={_quote(keyword)}&city={searcher.city_code}"
-        )
-        if searcher.exp_code:
-            url += f"&experience={searcher.exp_code}"
-        return url
+    def _build_search_url(self, keyword, searcher):
+        return searcher.build_search_url(keyword)
 
     def _force_boss_city(self, tab, searcher):
         """把浏览器 lastCity / 当前站写成配置城市，避免掉回青岛等默认城"""
@@ -544,123 +417,60 @@ class AutoBossApp:
             pass
         try:
             # 先落到配置城市站，减少 /qingdao/ 首页干扰
-            tab.get(f"https://www.zhipin.com/web/geek/jobs?city={code}")
+            tab.get(f"https://www.zhipin.com/web/geek/job?city={code}")
             tab.wait(2)
             self.logger.info(f"  🌏 已切换到配置城市：{city} ({code})")
         except Exception as e:
             self.logger.warning(f"  ⚠️ 切换城市失败: {e}")
 
-    def _job_wrong_city(self, job, city: str) -> bool:
-        """岗位城市明显不是配置城市时跳过（防 DOM/混排串城）"""
-        if not city:
+    def _job_wrong_city(self, job, city):
+        # Company HQ/name must not override the actual workplace.
+        location = (job.location or '').strip()
+        if not city or not location or city in location or str(city).isdigit():
             return False
-        text = f"{getattr(job, 'location', '') or ''} {job.title or ''} {job.company or ''}"
-        if city in text:
-            return False
-        # 仅当出现其他已知城市名、且不含配置城市时判定串城
-        for other in JobSearcher.CITY_CODES:
-            if other == city:
-                continue
-            if other in text:
-                return True
-        return False
+        return any(other in location for other in JobSearcher.CITY_CODES if other != city)
 
-    def _trigger_search(self, tab, keyword: str, searcher) -> bool:
-        """始终用配置城市的搜索 URL，禁止无城市参数的搜索框回落。"""
-        url = self._build_search_url(keyword, searcher)
-        self.logger.info(
-            f"  🌏 {searcher.city}({searcher.city_code}) | 关键词「{keyword}」"
-        )
-
-        if is_boss_security_page(tab, strict=True) and not has_job_cards(tab):
-            if not ensure_boss_api_ready(tab, self.logger, timeout=120):
-                return False
-            tab = self.work_tab or self.browser.latest_tab
-
-        # 无论 probe 是否瞬时失败，都强制带 city= 的 URL（避免掉回青岛）
-        try:
-            tab.get(url)
-            tab.wait(4)
-        except Exception as e:
-            self.logger.warning(f"  ⚠️ 搜索导航失败: {e}")
-            return False
-
-        cur = (tab.url or "")
-        if searcher.city_code not in cur:
-            self.logger.warning(
-                f"  ⚠️ 页面城市不是配置的 {searcher.city}，强制重开搜索 URL"
-            )
-            try:
-                self._force_boss_city(tab, searcher)
-                tab.get(url)
-                tab.wait(4)
-            except Exception as e:
-                self.logger.warning(f"  ⚠️ 重开搜索失败: {e}")
-
+    def _trigger_search(self, tab, keyword, searcher):
         if is_boss_security_page(tab, strict=True):
-            self.logger.warning("  ⚠️ 搜索触发验证，等待解锁...")
-            if not ensure_boss_api_ready(tab, self.logger, timeout=120):
-                return False
-            try:
-                tab.get(url)
-                tab.wait(4)
-            except Exception:
-                pass
-
-        wait_for_job_cards(tab, timeout=10)
-        if has_job_cards(tab):
-            self._scroll(tab)
-
-        final = (tab.url or "")[:140]
-        if searcher.city_code not in final:
-            self.logger.warning(f"  ⚠️ 最终 URL 城市仍异常 | {final}")
-        else:
-            self.logger.info(f"  ✅ 搜索「{keyword}」导航完成 | {final}")
+            searcher.capture_status = 'security'
+            searcher.capture_reason = '网站仍在校验，等待恢复后自动搜索'
+            return False
+        tab.get(self._build_search_url(keyword, searcher))
+        wait_for_job_cards(tab, timeout=4)
+        # Let the listener capture the server's reason even after navigation.
+        if is_boss_security_page(tab, strict=True):
+            return True
+        from urllib.parse import urlsplit
+        if any(x in urlsplit(tab.url).path for x in ('/passport', '/login')):
+            searcher.capture_status = 'login'
+            searcher.capture_reason = '搜索跳转到了登录页面'
+            return False
+        if not searcher._search_context_matches(tab, keyword):
+            searcher.capture_status = 'redirected'
+            searcher.capture_reason = '搜索被重定向，尚未进入目标关键词与城市的结果页'
+            return False
+        # A slow list is handled by the listener/DOM wait; do not submit a second
+        # UI search just because cards take more than four seconds to render.
         return True
 
-    def _ui_search(self, tab, keyword: str) -> bool:
-        """在首页/职位页用搜索框输入关键词（兼容 React 受控输入）"""
-        import json as _json
+    def _ui_search(self, tab, keyword):
+        from DrissionPage.common import Keys
         if not tab or is_boss_security_page(tab, strict=True):
             return False
-        try:
-            ok = tab.run_js(f"""
-                (() => {{
-                    const kw = {_json.dumps(keyword)};
-                    const inputs = Array.from(document.querySelectorAll(
-                        'input[placeholder*="职位"], input[placeholder*="搜索"],'
-                        + 'input[placeholder*="公司"], input[type="search"],'
-                        + '.search-input input, input.ipt, input[class*="search"]'
-                    ));
-                    let input = inputs.find(i => i.offsetParent !== null) || inputs[0];
-                    if (!input) return false;
-                    input.focus();
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    ).set;
-                    setter.call(input, kw);
-                    input.dispatchEvent(new Event('input', {{bubbles:true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles:true}}));
-                    const btn = document.querySelector(
-                        'button.btn-search, .btn-search, button[ka*="search"],'
-                        + '.search-btn, button[type="submit"], .search-form button'
-                    );
-                    if (btn) {{ btn.click(); return true; }}
-                    input.dispatchEvent(new KeyboardEvent('keydown', {{
-                        key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true
-                    }}));
-                    input.dispatchEvent(new KeyboardEvent('keyup', {{
-                        key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true
-                    }}));
-                    return true;
-                }})()
-            """)
-            if ok:
-                tab.wait(5)
-                return True
-        except Exception as e:
-            self.logger.debug(f"  UI搜索失败: {e}")
-        return False
+        selectors = ('input[placeholder*="职位"], input[placeholder*="搜索"], '
+                     'input[placeholder*="公司"], input[type="search"], .search-input input, input.search-input')
+        inputs = tab.eles('css:' + selectors)
+        entry = next((e for e in inputs if e.states.is_displayed), None)
+        if not entry:
+            return False
+        entry.input(keyword, clear=True)
+        buttons = tab.eles('css:button.btn-search, .btn-search, .search-btn, button[ka*="search"]')
+        button = next((e for e in buttons if e.states.is_displayed), None)
+        if button:
+            button.click()
+        else:
+            entry.input(Keys.ENTER)
+        return wait_for_job_cards(tab, timeout=6)
 
     def _recover_work_tab(self):
         """标签页断连时尝试恢复 BOSS 工作页"""
@@ -788,7 +598,7 @@ class AutoBossApp:
             p = resolve_path(cli_resume)
             if p.exists():
                 return [p]
-            self.logger.warning(f"CLI 指定的简历不存在: {cli_resume}")
+            raise FileNotFoundError(f"CLI 指定的简历不存在: {cli_resume}")
 
         resume_cfg = self.config.get("resume", {})
 
@@ -959,36 +769,22 @@ class AutoBossApp:
                   "1-3年":3,"3-5年":4,"5-10年":5,"10年以上":6}
 
     @classmethod
-    def _experience_too_high(cls, job, max_exp: str = "") -> bool:
-        """判断岗位经验要求是否超过 max_exp 限制（留空=不过滤）"""
-        if not max_exp:
+    def _experience_too_high(cls, job, max_exp=''):
+        if not max_exp or max_exp in ('不限', '经验不限'):
             return False
-
-        max_rank = cls._EXP_RANKS.get(max_exp, 3)
-
-        # 1) 从API经验字段判断
-        exp = (job.experience or "").strip()
-        for k, v in cls._EXP_RANKS.items():
-            if k in exp:
-                if v > max_rank:
-                    return True
-                return False  # 明确匹配在范围内
-
-        # 2) 从标题/描述提取年限数字
-        text = ((job.title or "") + " " + (job.description or "")[:500])
-        for yrs in range(max_rank + 1, 7):
-            pat = re.compile(rf'{yrs}\s*年[以之]?[上内]|至少\s*{yrs}\s*年|{yrs}\s*年以上|{yrs}\s*年\s*以上')
-            if pat.search(text):
+        caps = {'应届生': 0, '在校生': 0, '1年以内': 1, '1-3年': 3, '3-5年': 5, '5-10年': 10, '10年以上': 99}
+        cap = caps.get(max_exp, 3)
+        exp = (job.experience or '').strip()
+        if any(k in exp for k in ('不限', '应届', '在校', '实习')):
+            return False
+        numbers = re.findall(r'\d+', exp)
+        if numbers:
+            # Compare the minimum required years, not an enum rank or the upper end of a band.
+            return int(numbers[0]) > cap
+        if job.description:
+            years = re.findall(r'(?:至少|具备|拥有|要求)?\s*(\d+)\s*年(?:以上|及以上).*?(?:经验|经历)', job.description[:1000])
+            if years and max(map(int, years)) > cap:
                 return True
-
-        # 3) 高级职位关键词
-        if max_rank <= 2:  # 1-3年及以下
-            high_kw = ["senior", "资深", "高级", "主管", "经理", "组长", "负责人", "总监"]
-            title_low = (job.title or "").lower()
-            for kw in high_kw:
-                if kw.lower() in title_low:
-                    return True
-
         return False
 
     @staticmethod
@@ -1227,15 +1023,29 @@ def main():
     p.add_argument("--resume", "-r", default=None, help="简历文件路径")
     p.add_argument("--search-only", "-s", action="store_true")
     p.add_argument("--resume-only", "-ro", action="store_true")
+    p.add_argument("--interactive", action="store_true", help="启用关键词/筛选交互菜单")
+    p.add_argument("--doctor", action="store_true", help="检查配置和依赖，不登录不投递")
     args = p.parse_args()
 
     for name in ["app","resume","login","jobs","risk","matcher","submit","recorder"]:
         setup_logger(name, "INFO")
 
-    app = AutoBossApp(args.config)
-    app.run(search_only=args.search_only, resume_only=args.resume_only,
-            resume_path=args.resume)
+    from filelock import FileLock, Timeout
+    from diagnostics import diagnose
+    if args.doctor:
+        return diagnose(args.config)
+    try:
+        app = AutoBossApp(args.config)
+        with FileLock(str(resolve_path('.auto_boss.lock')), timeout=0):
+            return app.run(search_only=args.search_only, resume_only=args.resume_only,
+                           resume_path=args.resume, interactive=args.interactive)
+    except Timeout:
+        print('已有程序在运行，不能同时启动两个投递任务。')
+        return 2
+    except Exception as exc:
+        get_logger('app').exception('运行失败: %s', exc)
+        return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

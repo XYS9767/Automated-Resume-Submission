@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import re
+import os
+import time
 import json
 from enum import Enum
 from dataclasses import dataclass, field
@@ -122,7 +124,16 @@ class CompanyRiskChecker:
         risk_cfg = config.get("risk_check", {})
         self.mode = risk_cfg.get("mode", "rule")
         self.risk_keywords = risk_cfg.get("risk_keywords", [])
-        self.api_cfg = risk_cfg.get("api", {})
+        self.api_cfg = dict(risk_cfg.get("api", {}))
+        token = os.environ.get('DEEPSEEK_API_KEY') or str(self.api_cfg.get('token') or '')
+        if token.upper().startswith(('YOUR_', 'REPLACE_', 'SK-XXX')) or token in ('sk-xxx', ''):
+            token = ''
+        self.api_cfg['token'] = token
+        self.company_lookup = risk_cfg.get('company_lookup', False)
+        self._ai_disabled_until = 0
+        self._ai_failures = 0
+        if self.mode == 'api' and not token:
+            logger.warning('没有有效 API Key，自动使用本地匹配/风险规则，不逐岗请求占位密钥。')
 
         self._session = requests.Session()
         self._session.headers.update({
@@ -137,6 +148,31 @@ class CompanyRiskChecker:
         self._aiqicha_last_at = 0.0
 
         logger.info(f"风险检测模式: {self.mode}")
+
+    @property
+    def ai_available(self):
+        return (self.mode == 'api' and self.api_cfg.get('provider', 'deepseek') == 'deepseek'
+                and bool(self.api_cfg.get('token')) and time.monotonic() >= self._ai_disabled_until)
+
+    def _post_ai(self, url, **kwargs):
+        if not self.ai_available:
+            raise RuntimeError('AI 暂不可用，使用本地规则')
+        kwargs['timeout'] = (5, self.api_cfg.get('timeout', 20))
+        kwargs['json']['model'] = self.api_cfg.get('model', 'deepseek-chat')
+        kwargs['json']['response_format'] = {'type': 'json_object'}
+        url = self.api_cfg.get('base_url', 'https://api.deepseek.com/v1').rstrip('/') + '/chat/completions'
+        try:
+            response = self._session.post(url, **kwargs)
+            if response.status_code in (400, 401, 402, 403, 404):
+                self.api_cfg['token'] = ''
+                logger.warning('AI 配置/余额/权限错误 HTTP %s，本次停用 AI。', response.status_code)
+            response.raise_for_status()
+            self._ai_failures = 0
+            return response
+        except requests.RequestException:
+            self._ai_failures += 1
+            self._ai_disabled_until = time.monotonic() + 120
+            raise
 
     def set_browser(self, browser):
         """注入浏览器实例，用于爱企查等平台的公司信息查询"""
@@ -184,7 +220,7 @@ class CompanyRiskChecker:
         if self._is_anonymous_company(name):
             logger.info(f"  🏢 匿名公司「{name}」，跳过爱企查")
             return self._check_via_rules(name, job)
-        if self.mode == "api" and self.api_cfg.get("token"):
+        if self.ai_available:
             return self._check_via_api(name, job)
         else:
             return self._check_via_rules(name, job)
@@ -384,7 +420,7 @@ class CompanyRiskChecker:
         provider = self.api_cfg.get("provider", "")
         token = self.api_cfg.get("token", "")
 
-        if not token:
+        if not token or not self.ai_available:
             logger.warning("API token 未配置，回退到规则模式")
             return self._check_via_rules(name, job)
 
@@ -493,11 +529,13 @@ class CompanyRiskChecker:
     def _check_via_deepseek(self, name: str, job: Optional[dict] = None) -> RiskResult:
         """先浏览器查爱企查 → 结果喂给 DeepSeek 分析 → 无结果时规则兜底"""
         token = self.api_cfg.get("token", "")
-        if not token:
+        if not token or not self.ai_available:
             return self._check_via_rules(name, job)
 
-        aiqicha_data = self._scrape_company_info(name)
+        aiqicha_data = self._scrape_company_info(name) if self.company_lookup else ""
         has_direct_data = bool(aiqicha_data and len(aiqicha_data) > 100)
+        if not has_direct_data:
+            return self._check_via_rules(name, job)
 
         if not has_direct_data:
             logger.info(f"  🔍 爱企查无数据，规则模式评估: \"{name}\"")
@@ -520,7 +558,7 @@ class CompanyRiskChecker:
         self._log_deepseek("REQ-风险", f"公司: {name} | 爱企查数据: {len(aiqicha_data)}字符")
 
         try:
-            resp = self._session.post(
+            resp = self._post_ai(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -612,7 +650,7 @@ class CompanyRiskChecker:
         else:
             result.level = self._score_to_level(result.score)
 
-        result.details = {"company": name, "mode": "deepseek+search",
+        result.details = {"company": name, "mode": "deepseek+provided_company_data",
                           "summary": summary, "raw": parsed}
         logger.info(
             f"  🤖 DeepSeek [{result.level.value}] {name}: "
@@ -641,7 +679,7 @@ class CompanyRiskChecker:
         失败返回 None → 回退规则匹配
         """
         token = self.api_cfg.get("token", "")
-        if not token:
+        if not token or not self.ai_available:
             return None
 
         resume_snippet = resume_text[:5000] if resume_text else ""
@@ -688,12 +726,12 @@ class CompanyRiskChecker:
             "score<35=方向完全不符 fit=false"
         )
 
-        self._log_deepseek("REQ-匹配", f"岗位: {title} @ {job.get('company','?')}\n简历: {resume_snippet[:300]}")
+        self._log_deepseek("REQ-匹配", f"岗位: {title} @ {job.get('company','?')}")
 
         last_err = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                resp = self._session.post(
+                resp = self._post_ai(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={
                         "Authorization": f"Bearer {token}",
@@ -717,6 +755,10 @@ class CompanyRiskChecker:
 
                 score = min(100, max(0, int(parsed.get("score", 50))))
                 fit = parsed.get("fit", score >= 50)
+                if isinstance(fit, str):
+                    fit = fit.strip().lower() == 'true'
+                if not isinstance(fit, bool):
+                    raise ValueError('AI fit 字段必须为布尔值')
                 reasons = parsed.get("reasons", [])
                 if isinstance(reasons, str):
                     reasons = [reasons]
@@ -731,7 +773,7 @@ class CompanyRiskChecker:
                 return {"score": score, "fit": fit, "reasons": reasons, "missing": missing}
             except Exception as e:
                 last_err = e
-                if attempt < 2:
+                if attempt < 1 and self.ai_available:
                     import time as _time
                     logger.warning(f"  AI匹配重试({attempt + 1}/3): {e}")
                     _time.sleep(2 + attempt * 2)
@@ -748,7 +790,7 @@ class CompanyRiskChecker:
         失败返回空列表 → 使用配置文件中的关键词
         """
         token = self.api_cfg.get("token", "")
-        if not token:
+        if not token or not self.ai_available:
             return []
 
         resume_snippet = resume_text[:2500] if resume_text else ""
@@ -767,7 +809,7 @@ class CompanyRiskChecker:
         )
 
         try:
-            resp = self._session.post(
+            resp = self._post_ai(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {token}",

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import resolve_path, clean_text, get_logger
+from relevance import contains_term
 
 logger = get_logger("resume")
 
@@ -38,6 +39,7 @@ class ResumeData:
     education: list[Experience] = field(default_factory=list)
     raw_text: str = ""
     parsed_from: str = ""
+    declared_experience_years: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +98,7 @@ class ResumeParser:
         "Linux", "Git", "HTTP", "TCP/IP", "WebSocket", "RESTful", "GraphQL", "gRPC",
         # 大数据 & AI
         "Hadoop", "Spark", "Flink", "Storm", "TensorFlow", "PyTorch",
+        "LLM", "大模型", "AIGC", "RAG", "Agent", "智能体", "LangChain", "LangGraph", "LoRA",
         "Scikit-learn", "Pandas", "NumPy", "Matplotlib", "Jupyter",
         "MapReduce", "YARN", "HDFS", "SparkCore", "SparkSQL",
         "SparkStreaming", "SparkOnYARN", "ZooKeeper",
@@ -143,11 +146,11 @@ class ResumeParser:
         ],
     }
 
-    # 日期范围：2020.01-2022.06 / 2020/01-至今 / 2021.9-2024.6
+    # Supports year-only ranges and month ranges; 2021-2025 must not parse as month 20.
+    _DATE_TOKEN = r"(?:19|20)\d{2}(?:\s*[年./-]\s*(?:0?[1-9]|1[0-2])(?!\d)(?:\s*月)?)?"
     DATE_RANGE_PATTERN = re.compile(
-        r"(\d{4}\s*[年./-]?\s*\d{1,2}\s*[月]?)\s*"
-        r"[-~–—至到]\s*"
-        r"(\d{4}\s*[年./-]?\s*\d{1,2}\s*[月]?|至今|现在|Now|now)"
+        rf"(?<!\d)({_DATE_TOKEN})\s*[-~–—至到]\s*({_DATE_TOKEN}|至今|现在|Present|Now)(?!\d)",
+        re.IGNORECASE,
     )
 
     # 日期后的「公司 + 职位」拆分
@@ -171,16 +174,21 @@ class ResumeParser:
 
         ext = self.file_path.suffix.lower()
         raw_text = self._read_file(ext)
+        return self.parse_text(raw_text, self.file_path.name)
+
+    def parse_text(self, raw_text, source="在线简历") -> ResumeData:
         self.logger.info(f"原文长度: {len(raw_text)} 字符")
 
-        resume = ResumeData(raw_text=raw_text, parsed_from=self.file_path.name)
+        resume = ResumeData(raw_text=raw_text, parsed_from=source)
 
         self._extract_contact(resume)
         self._extract_skills(resume)
         self._extract_sections(resume)
 
         # 如果结构化提取的工作经历为空，走全文本兜底
-        if len(resume.work_experiences) == 0:
+        if len(resume.work_experiences) == 0 and not any(
+            self._detect_section(line) == 'work' for line in raw_text.splitlines()
+        ):
             self.logger.info("结构化提取工作经历为 0，尝试全局扫描...")
             self._parse_work_experiences(resume, raw_text.split("\n"))
 
@@ -220,8 +228,8 @@ class ResumeParser:
 
         # 方式 2: PyMuPDF
         try:
-            import fitz
-            doc = fitz.open(str(self.file_path))
+            import pymupdf
+            doc = pymupdf.open(str(self.file_path))
             text_mupdf = "\n".join(page.get_text() for page in doc)
             doc.close()
             self.logger.debug(f"PyMuPDF: {len(text_mupdf)} 字符")
@@ -302,7 +310,7 @@ class ResumeParser:
         text_lower = resume.raw_text.lower()
         matched = set()
         for skill in self.SKILL_KEYWORDS:
-            if skill.lower() in text_lower:
+            if contains_term(text_lower, skill):
                 matched.add(skill)
         resume.skills = sorted(matched, key=lambda s: self.SKILL_KEYWORDS.index(s) if s in self.SKILL_KEYWORDS else 999)
 
@@ -397,94 +405,53 @@ class ResumeParser:
             exp.company_or_school = company or clean_text(after)
             exp.title_or_major = title
 
-    def _parse_work_experiences(self, resume: ResumeData, lines: list[str]):
-        """从行列表中解析工作经历"""
-        if not lines:
-            return
-
-        date_pattern = self.DATE_RANGE_PATTERN
-        current = Experience()
-        for line in lines:
-            line = re.sub(r"^[\uf06c\u2022●•·\-\*]\s*", "", line.strip())
-            if not line:
+    def _parse_entries(self, lines, kind):
+        """Associate adjacent organization, date, role and degree lines in PDF text."""
+        entries = []
+        lines = [re.sub(r'^[\uf06c\u2022●•·*]\s*', '', str(line).strip()) for line in lines]
+        anchors = [(i, self.DATE_RANGE_PATTERN.search(line)) for i, line in enumerate(lines)]
+        anchors = [(i, m) for i, m in anchors if m]
+        organization = r'大学|学院|学校|University|College' if kind == 'edu' else r'公司|集团|研究院|事务所|工作室|Corporation|Ltd|Inc'
+        for pos, (index, match) in enumerate(anchors):
+            end = anchors[pos+1][0] if pos+1 < len(anchors) else len(lines)
+            inline = clean_text(lines[index][:match.start()] + ' ' + lines[index][match.end():])
+            previous = lines[max(0, index-2):index]
+            following = lines[index+1:end]
+            org = inline
+            if not org:
+                org = next((line for line in reversed(previous)
+                            if len(line) < 100 and re.search(organization, line, re.I)), '')
+            if not org:
+                org = next((line for line in following[:2]
+                            if len(line) < 100 and re.search(organization, line, re.I)), '')
+            if not org:
+                # Avoid inventing an employer out of project/education date ranges.
                 continue
+            entry = Experience(start_date=match.group(1).strip(), end_date=match.group(2).strip())
+            if kind == 'work':
+                entry.company_or_school, entry.title_or_major = self._split_company_title(org)
+                explicit_role = next((line for line in following[:3] if re.match(r'^(?:岗位|职位|职务)[：:]', line)), '')
+                if explicit_role:
+                    entry.title_or_major = re.sub(r'^(?:岗位|职位|职务)[：:]\s*', '', explicit_role)
+                elif not entry.title_or_major:
+                    entry.title_or_major = next((line for line in following[:2]
+                                                if len(line) < 40 and re.search(r'工程师|经理|专员|开发|运维', line)), '')
+            else:
+                entry.company_or_school = org
+                entry.title_or_major = next((line for line in [inline, *following[:3]]
+                                            if any(degree in line for degree in self.DEGREE_KEYWORDS)), '')
+            # Do not include the next employer/school header in this description.
+            if pos+1 < len(anchors) and following and re.search(organization, following[-1], re.I) and len(following[-1]) < 100:
+                following = following[:-1]
+            entry.description = ' '.join(line for line in following if line and line != org)
+            entries.append(entry)
+        return entries
 
-            dm = date_pattern.search(line)
-            if dm:
-                if current.start_date and (current.company_or_school or current.title_or_major):
-                    resume.work_experiences.append(current)
-                current = Experience(
-                    start_date=dm.group(1).strip(),
-                    end_date=dm.group(2).strip(),
-                )
-                self._fill_experience_from_date_line(line, dm, current)
-            elif current.start_date:
-                stripped = clean_text(line)
-                if stripped:
-                    current.description += stripped + " "
+    def _parse_work_experiences(self, resume, lines):
+        resume.work_experiences.extend(self._parse_entries(lines, 'work'))
 
-        if current.start_date and (current.company_or_school or current.title_or_major):
-            resume.work_experiences.append(current)
-
-        for exp in resume.work_experiences:
-            if not exp.title_or_major:
-                for keyword in ["工程师", "开发", "经理", "主管", "实习", "专员", "负责人", "技术总监"]:
-                    if keyword in exp.description or keyword in exp.company_or_school:
-                        exp.title_or_major = keyword
-                        break
-            if not exp.description:
-                exp.description = ""
-
-    def _parse_education(self, resume: ResumeData, lines: list[str]):
-        """解析教育背景"""
-        if not lines:
-            return
-
-        date_pattern = self.DATE_RANGE_PATTERN
-        current = Experience()
-        for line in lines:
-            line = re.sub(r"^[\uf06c\u2022●•·\-\*]\s*", "", line.strip())
-            if not line:
-                continue
-
-            dm = date_pattern.search(line)
-            if dm:
-                if current.start_date and current.company_or_school:
-                    resume.education.append(current)
-                current = Experience(
-                    start_date=dm.group(1).strip(),
-                    end_date=dm.group(2).strip(),
-                )
-                after = clean_text(line[dm.end():])
-                before = clean_text(line[:dm.start()])
-                body = after or before
-
-                school, major = "", ""
-                for dk in self.DEGREE_KEYWORDS:
-                    if dk in body:
-                        major = dk
-                        break
-
-                if major:
-                    school = body.replace(major, "").strip(" ，,")
-                else:
-                    parts = body.rsplit(" ", 1)
-                    if len(parts) == 2 and len(parts[1]) <= 12:
-                        school, major = parts[0], parts[1]
-                    else:
-                        school = body
-
-                current.company_or_school = school.strip(" ，,")
-                current.title_or_major = major
-            elif current.start_date:
-                stripped = clean_text(line)
-                if any(dk in stripped for dk in self.DEGREE_KEYWORDS) and not current.title_or_major:
-                    current.title_or_major = stripped
-                elif stripped:
-                    current.description += stripped + " "
-
-        if current.start_date and current.company_or_school:
-            resume.education.append(current)
+    def _parse_education(self, resume, lines):
+        resume.education.extend(self._parse_entries(lines, 'edu'))
 
 
 # ---------- 便捷入口 ----------

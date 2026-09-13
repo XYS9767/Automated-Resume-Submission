@@ -69,6 +69,7 @@ def load_config(path: str = "config.yaml") -> dict:
         raise FileNotFoundError(f"配置文件不存在: {cfg_path}")
     with open(cfg_path, "r", encoding="utf-8") as f:
         _config_cache[path] = yaml.safe_load(f)
+        validate_config(_config_cache[path])
     return _config_cache[path]
 
 
@@ -82,6 +83,7 @@ def reload_config(path: str = "config.yaml"):
 # ---------- 日志 ----------
 
 _log_initialized: set[str] = set()
+_file_handlers = {}
 
 
 def setup_logger(name: str = "auto-boss", level: str = "INFO") -> logging.Logger:
@@ -108,6 +110,13 @@ def setup_logger(name: str = "auto-boss", level: str = "INFO") -> logging.Logger
         )
         ch.setFormatter(fmt)
         logger.addHandler(ch)
+        from logging.handlers import RotatingFileHandler
+        log_path = str(project_root() / 'runtime.log')
+        if log_path not in _file_handlers:
+            handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=2, encoding='utf-8')
+            handler.setFormatter(logging.Formatter('%(asctime)s %(name)s %(levelname)s %(message)s'))
+            _file_handlers[log_path] = handler
+        logger.addHandler(_file_handlers[log_path])
 
     _log_initialized.add(name)
     return logger
@@ -223,11 +232,20 @@ def ensure_dir(path: str):
 
 
 def safe_save_json(data, path: str):
-    """安全写入 JSON 文件"""
+    """Atomic replacement; a killed process never truncates the existing ledger."""
+    import tempfile
     p = resolve_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    fd, temp = tempfile.mkstemp(prefix=p.name + '.', suffix='.tmp', dir=p.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, p)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 # 非简历文件（自动扫描时排除）
@@ -270,3 +288,39 @@ def find_all_resume_files(base_dir: Optional[Path] = None) -> list[Path]:
         return []
     candidates.sort()
     return [c[2] for c in candidates]
+
+
+def validate_config(config):
+    if not isinstance(config, dict):
+        raise ValueError('配置必须是 YAML 对象')
+    for key in ('browser', 'login', 'resume', 'search', 'filter', 'submit', 'risk_check', 'output', 'runtime'):
+        config.setdefault(key, {})
+        if not isinstance(config[key], dict):
+            raise ValueError(key + ' 必须是 YAML 对象')
+    if config['resume'].get('source', 'local') not in ('local', 'boss_online'):
+        raise ValueError('resume.source 只支持 local 或 boss_online')
+    if config['browser'].get('proxy_mode', 'system') not in ('system', 'direct'):
+        raise ValueError('browser.proxy_mode 只支持 system 或 direct')
+    search = config['search']
+    search.setdefault('keywords', [])
+    if not isinstance(search['keywords'], list) or any(not isinstance(k, str) for k in search['keywords']):
+        raise ValueError('search.keywords 必须是字符串列表')
+    search.setdefault('page_limit', 10)
+    if not isinstance(search['page_limit'], int) or not 1 <= search['page_limit'] <= 100:
+        raise ValueError('search.page_limit 必须为 1~100')
+    submit = config['submit']
+    submit.setdefault('daily_limit', 150)
+    submit.setdefault('interval', {'min': 8, 'max': 20})
+    lo, hi = submit['interval']['min'], submit['interval']['max']
+    if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)) or not 0 <= lo <= hi:
+        raise ValueError('投递间隔必须满足 0 <= min <= max')
+    if not isinstance(submit['daily_limit'], int) or submit['daily_limit'] < 1:
+        raise ValueError('submit.daily_limit 必须为正整数')
+    for key in ('min_match_score', 'ai_fit_min_score', 'skip_kpi_score'):
+        value = config['filter'].get(key, 50)
+        if not isinstance(value, (int, float)) or not 0 <= value <= 100:
+            raise ValueError('filter.' + key + ' 必须为 0~100')
+    for key in ('exclude_titles', 'exclude_companies'):
+        values = config['filter'].get(key, [])
+        if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+            raise ValueError('filter.' + key + ' 必须是字符串列表')

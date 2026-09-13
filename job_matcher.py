@@ -22,6 +22,7 @@ from typing import Optional
 from resume_parser import ResumeData
 from job_search import JobPosting, JobSearcher
 from utils import get_logger
+from relevance import contains_term, canonical_skill, is_skill_label
 
 logger = get_logger("matcher")
 
@@ -83,12 +84,13 @@ class JobMatcher:
         self.weights = weights or self.WEIGHTS.copy()
 
         # 预计算：避免每次 match() 重复计算
-        self._resume_skills_lower = set(s.lower() for s in resume.skills)
+        self._resume_skills_lower = set(canonical_skill(s) for s in resume.skills)
         self._resume_words = set(
             re.findall(r"[a-zA-Z\u4e00-\u9fff]+", resume.raw_text.lower())
         )
         self._tech_kw_lower = {s.lower() for s in JobSearcher.TECH_KEYWORDS}
-        self._my_exp_years = self._calculate_total_experience_years()
+        self._my_exp_years = (resume.declared_experience_years if resume.declared_experience_years is not None
+                              else self._calculate_total_experience_years())
         self._my_edu_level = self._get_highest_education_level()
 
         self._stopwords = {
@@ -100,6 +102,18 @@ class JobMatcher:
 
         logger.info(f"匹配器初始化: 简历技能 {len(resume.skills)} 项, "
                      f"工作经历 {len(resume.work_experiences)} 段")
+
+    def missing_title_skills(self, job):
+        """An explicit primary language/platform in the title is a real requirement."""
+        primary = ('Java', 'Python', 'C', 'C++', 'C#', 'Go', 'PHP', 'Rust',
+                   'Swift', 'Kotlin', 'Dart', 'Flutter', 'Scala')
+        required = [s for s in primary if contains_term(job.title, s)]
+        present = [s for s in required if canonical_skill(s) in self._resume_skills_lower
+                   or contains_term(self.resume.raw_text, s)]
+        # Titles such as Java/Python explicitly offer alternatives.
+        if present and re.search(r'/|或|任选', job.title):
+            return []
+        return [s for s in required if s not in present]
 
     def match(self, job: JobPosting) -> MatchResult:
         """
@@ -122,20 +136,20 @@ class JobMatcher:
         # 5. 关键词匹配
         self._calc_keyword_match(job, result)
 
-        # 6. 标题加分：标题含嵌入式关键词 → +15 分（解决应届生卡片信息不足的问题）
+        # 6. 标题与当前简历技能一致时加分
         title_bonus = self._calc_title_bonus(job.title)
         if title_bonus > 0:
             result.match_details.append(f"标题匹配: +{title_bonus:.0f}分")
 
         # 综合总分 = 各维度加权求和
-        result.total_score = (
+        result.total_score = min(100.0, (
             result.skill_score
             + result.experience_score
             + result.education_score
             + result.salary_score
             + result.keyword_score
             + title_bonus
-        )
+        ))
 
         logger.debug(
             f"匹配 [{job.title} @ {job.company}] "
@@ -152,18 +166,17 @@ class JobMatcher:
 
     def _calc_skill_match(self, job: JobPosting, result: MatchResult):
         resume_skills = self._resume_skills_lower
-        job_skills = set(s.lower() for s in job.skills_required)
-
-        if not job_skills:
-            if job.description:
-                desc_lower = job.description.lower()
-                job_skills = {s for s in self._tech_kw_lower if s in desc_lower}
+        job_skills = {canonical_skill(s) for s in job.skills_required if is_skill_label(s)}
+        # Detail requirements must augment sparse card labels, even if labels exist.
+        job_skills.update(canonical_skill(s) for s in self._tech_kw_lower
+                          if contains_term(job.title + ' ' + job.description, s))
 
         if not job_skills:
             result.skill_score = self.weights["skill"] * 100 * 0.6
             result.match_details.append("岗位无明确技能要求，取默认分")
             return
 
+        resume_skills = resume_skills | {s for s in job_skills if contains_term(self.resume.raw_text, s)}
         matched = resume_skills & job_skills
         missing = job_skills - resume_skills
         ratio = len(matched) / len(job_skills) if job_skills else 0.6
@@ -212,6 +225,9 @@ class JobMatcher:
             )
 
     def _calc_education_match(self, job: JobPosting, result: MatchResult):
+        if not job.education or '不限' in job.education:
+            result.education_score = self.weights['education'] * 100
+            return
         req_level = self.EDUCATION_LEVELS.get(job.education, 3)
         my_level = self._my_edu_level
 
@@ -234,6 +250,10 @@ class JobMatcher:
             result.salary_score = self.weights["salary"] * 100 * 0.5
             return
 
+        if '/天' in job.salary or '元/日' in job.salary:
+            result.salary_score = self.weights['salary'] * 100 * .7
+            result.match_details.append('日薪岗位单独计分，不与月薪直接比较')
+            return
         my_exp = self._my_exp_years
         if my_exp <= 1:
             expected_min, expected_max = 8000, 15000
@@ -342,29 +362,7 @@ class JobMatcher:
                         level = lvl
         return level
 
-    def _calc_title_bonus(self, title: str) -> float:
-        """标题包含嵌入式关键词 → 加分（最高15分）"""
-        if not title:
-            return 0
-
-        title_lower = title.lower()
-        # 强相关关键词（+5分/个，上限15）
-        strong = ["嵌入式", "单片机", "stm32", "arm", "rtos", "linux驱动",
-                   "freertos", "fpga", "dsp", "物联网", "iot", "bms", "can",
-                   "汽车电子", "工业控制", "电机控制", "固件"]
-        # 弱相关关键词（+2分/个，上限6）
-        weak = ["c/c++", "c++", "驱动", "底层", "硬件", "电子工程师",
-                "系统软件", "通信", "自动化", "机器人"]
-
-        bonus = 0.0
-        for kw in strong:
-            if kw in title_lower:
-                bonus += 5.0
-                if bonus >= 15.0:
-                    return 15.0
-        for kw in weak:
-            if kw in title_lower:
-                bonus += 2.0
-                if bonus >= 15.0:
-                    return 15.0
-        return min(bonus, 15.0)
+    def _calc_title_bonus(self, title):
+        # No universal embedded/hardware bonus: use this candidate's actual skills.
+        matched = [s for s in self._resume_skills_lower if contains_term(title, s)]
+        return min(10.0, len(matched) * 5.0)

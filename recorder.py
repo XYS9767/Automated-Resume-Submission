@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from job_search import JobPosting
+from job_search import JobPosting, job_url_key
 from job_matcher import MatchResult
 from company_risk import RiskResult
 from submitter import SubmitResult
@@ -43,6 +43,7 @@ class ApplyRecorder:
         match: Optional[MatchResult] = None,
         risk: Optional[RiskResult] = None,
         submit_result: Optional[str] = None,
+        *, reason="", score=None, resume_name="", details=None,
     ):
         """
         记录一次投递结果
@@ -111,17 +112,25 @@ class ApplyRecorder:
             SubmitResult.LOGIN_REQUIRED: "需重新登录",
             SubmitResult.DAILY_LIMIT: "已达每日上限",
             SubmitResult.FAILED: "投递失败",
+            SubmitResult.SECURITY_REQUIRED: "需安全验证",
+            SubmitResult.UNCONFIRMED: "沟通结果待核实",
             SubmitResult.RISK_REJECTED: "公司风险过高,跳过",
             SubmitResult.MATCH_LOW: "匹配度过低,跳过",
             SubmitResult.KPI_REJECTED: "KPI刷量岗位,跳过",
         }
         record["result"] = result_map.get(submit_result, submit_result or "未知")
 
+        record.update(reason=reason, resume_name=resume_name, details=details or {},
+                      job_key=job_url_key(job.url), source_keyword=job.source_keyword)
+        if score is not None:
+            record['match_score'] = round(score, 1)
+
         # 追加到内存列表
         self._records.append(record)
 
         # 写入 CSV
         self._append_csv(record)
+        self.save_json()
 
         logger.info(
             f"记录: {record['result']} | "
@@ -184,7 +193,7 @@ class ApplyRecorder:
         if not job_url:
             return False
         for r in self._records:
-            if r.get("url") == job_url:
+            if job_url_key(r.get("url", "")) == job_url_key(job_url):
                 return True
         return False
 
@@ -193,7 +202,7 @@ class ApplyRecorder:
         if not job_url:
             return False
         for r in self._records:
-            if r.get("url") == job_url and r.get("result") == "投递成功":
+            if job_url_key(r.get("url", "")) == job_url_key(job_url) and r.get("result") == "投递成功":
                 return True
         return False
 
@@ -212,7 +221,7 @@ class ApplyRecorder:
                 self._records = data.get("records", [])
                 logger.info(f"加载已有记录 {len(self._records)} 条")
             except (json.JSONDecodeError, Exception) as e:
-                logger.warning(f"加载历史记录失败: {e}")
+                raise ValueError(f"历史记录损坏，请恢复备份后重试: {self.json_path}") from e
 
     def _append_csv(self, record: dict):
         """追加一行到 CSV 文件"""
@@ -227,10 +236,13 @@ class ApplyRecorder:
             "education_score", "salary_score", "keyword_score",
             "risk_level", "risk_score",
             "missing_skills", "company_size", "company_industry",
-            "url",
+            "url", "reason", "resume_name", "source_keyword",
         ]
 
-        file_exists = self.csv_path.exists()
+        file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
+        if file_exists:
+            with self.csv_path.open(encoding='utf-8-sig', newline='') as existing:
+                fieldnames = next(csv.reader(existing))
         try:
             with open(self.csv_path, "a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)

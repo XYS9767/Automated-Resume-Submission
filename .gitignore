@@ -36,4 +36,24 @@ dist/
 .DS_Store
 Thumbs.db
 
-config.yaml  -ss
+config.yaml
+
+.venv/
+.pytest_cache/
+.ruff_cache/
+submission_state.json
+pending_jobs.json
+last_run_summary.json
+runtime.log
+.auto_boss.lock
+*.tmp
+
+debug_live/
+stop_requested.flag
+runtime_console.*.log
+
+# 本机调试与导出材料
+*.log
+代码变更.patch
+现场调试记录*.md
+*.zip
