@@ -53,6 +53,14 @@ def check_archive(path, package_name):
             raise ValueError('Release archive CRC check failed')
 
 
+def copy_payload(source, destination):
+    if source.suffix.lower() == '.bat':
+        text = source.read_text(encoding='utf-8-sig')
+        destination.write_bytes(text.replace('\n', '\r\n').encode('utf-8'))
+    else:
+        shutil.copy2(source, destination)
+
+
 def verify_archive(path, package_name):
     check_archive(path, package_name)
     with tempfile.TemporaryDirectory(prefix='BOSS-发布验证-') as temporary:
@@ -69,6 +77,20 @@ def verify_archive(path, package_name):
             print(result.stdout, end='')
             if result.returncode:
                 raise RuntimeError('Packaged executable failed ' + flag + ': ' + result.stderr)
+        for name, arguments in (('停止自动投递.bat', ''), ('启动.bat', '--help'),
+                                ('预览岗位.bat', '--help'), ('检查环境.bat', '')):
+            command = '"' + os.environ['COMSPEC'] + '" /d /c call "' + name + '" ' + arguments
+            result = subprocess.run(command, input='\n', cwd=package, env=env, capture_output=True,
+                                    encoding='utf-8', errors='replace', timeout=90)
+            if result.returncode:
+                raise RuntimeError('Packaged launcher failed ' + name + ': ' + result.stderr)
+            if name == '停止自动投递.bat' and not (package / 'stop_requested.flag').exists():
+                raise RuntimeError('Stop launcher did not create the stop flag')
+            if name == '启动.bat' and (package / 'stop_requested.flag').exists():
+                raise RuntimeError('Start launcher did not clear the stop flag')
+            if name == '检查环境.bat' and ('[ERROR]' in result.stdout or '[OK]' not in result.stdout):
+                raise RuntimeError('Packaged diagnostics did not pass')
+            print('PACKAGED LAUNCHER OK:', name)
         if (package / 'browser_data').exists() or (package / 'submission_state.json').exists():
             raise RuntimeError('Offline verification unexpectedly started a browser or submission')
 
@@ -99,7 +121,7 @@ def build(version):
     package.mkdir()
     shutil.copy2(work / 'binary' / (APP + '.exe'), package)
     for name in PAYLOAD:
-        shutil.copy2(template / name, package / name)
+        copy_payload(template / name, package / name)
     shutil.copy2(ROOT / 'LICENSE', package)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     dirty = bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip())

@@ -3,7 +3,7 @@ from pathlib import Path
 import zipfile
 import pytest
 import yaml
-from build_release import PAYLOAD, APP, check_archive, validate_public_config
+from build_release import PAYLOAD, APP, check_archive, validate_public_config, copy_payload
 
 
 def template():
@@ -43,3 +43,12 @@ def test_archive_allowlist_rejects_cookie_and_traversal(tmp_path):
             z.writestr('release/' + extra, 'must not ship')
         with pytest.raises(ValueError, match='unexpected'):
             check_archive(archive, 'release')
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_batch_files_use_crlf_and_keep_chinese_text(tmp_path, newline):
+    source = tmp_path / 'source.bat'
+    destination = tmp_path / 'release.bat'
+    source.write_bytes(('@echo off' + newline + 'echo 已停止' + newline).encode('utf-8'))
+    copy_payload(source, destination)
+    assert destination.read_bytes() == '@echo off\r\necho 已停止\r\n'.encode('utf-8')
