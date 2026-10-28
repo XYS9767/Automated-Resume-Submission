@@ -82,13 +82,15 @@ def is_boss_security_page(tab, strict: bool = False) -> bool:
     """是否处于 BOSS 安全验证页。
 
     注意：普通职位页正文也可能出现「验证码」字样，不能单靠文案误判。
-    strict=True 时只认 URL / 明确验证控件；默认也会识别明显滑块文案。
+    验证路由、可见验证控件或明确验证文案才表示仍需验证。
+    登录成功后可能保留 _security_check 查询参数，不能单独据此阻塞。
     """
     try:
         url = (tab.url or "").lower()
-        # 明确风控 URL（最可靠）
-        if any(k in url for k in (
-            "security.html", "_security_check=",
+        # 只检查当前路由，不把查询参数中的历史验证地址当成当前页面。
+        path = urlsplit(url).path
+        if any(k in path for k in (
+            "security.html",
             "/web/passport/zp/security", "/captcha", "antispam",
         )):
             return True

@@ -1,0 +1,102 @@
+browser:
+  headless: false
+  data_dir: ./browser_data
+  kill_edge_on_start: false
+  window_size:
+  - 1280
+  - 800
+  keep_open: true
+  proxy_mode: system
+  slow_mo: 500
+login:
+  method: qr
+  cookie_file: ./cookies.json
+  wait_seconds: 180
+resume:
+  source: boss_online
+  resume_dir: ./resumes
+  file_paths: []
+  file_path: ''
+  encoding: utf-8
+search:
+  source: config
+  keywords:
+  - 运维开发工程师
+  - 运维工程师
+  - 云原生运维
+  - DevOps
+  city: 深圳
+  path: /web/geek/jobs
+  experience: ''
+  salary: 15-20K
+  page_limit: 10
+  jobs_per_page: 15
+filter:
+  job_type: fulltime
+  exclude_titles:
+  - 驻场
+  - 外包
+  - 外派
+  - 劳务
+  - 培训
+  - 急聘
+  - 大量招
+  - 小白
+  - 普工
+  - 留学生
+  - 驻场
+  - 实施
+  exclude_companies:
+  - 人力资源
+  - 劳务派遣
+  - 外包服务
+  - 保险
+  - 理财
+  - 投资管理
+  - 融资
+  - 留学生
+  min_match_score: 75
+  skip_kpi: true
+  skip_kpi_score: 70
+  ai_fit_check: true
+  ai_fit_min_score: 50
+  max_education: 本科
+  max_experience: 3年
+  require_boss_online: false
+  max_boss_inactive: 今日活跃
+risk_check:
+  mode: api
+  company_lookup: false
+  block_levels:
+  - high
+  api:
+    provider: deepseek
+    token: ''
+    model: deepseek-chat
+    timeout: 20
+  risk_keywords:
+  - 裁员
+  - 欠薪
+  - 纠纷
+  - 失信
+  - 倒闭
+  - 跑路
+  - 骗子
+  - 皮包
+submit:
+  greeting: 您好，我对贵司的这个岗位很感兴趣，方便进一步沟通吗？
+  send_greeting: true
+  daily_limit: 150
+  interval:
+    min: 8
+    max: 20
+output:
+  log_file: ./submit_log.csv
+  record_file: ./apply_record.json
+  log_level: INFO
+runtime:
+  security_wait_seconds: 180
+  search_retry_delay: 5
+  max_consecutive_failures: 5
+  recovery_cooldown: 30
+  recovery_rounds: 2

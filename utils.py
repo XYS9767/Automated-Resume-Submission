@@ -171,6 +171,10 @@ def extract_salary_range(text: str) -> tuple:
     m2 = re.search(pattern2, text)
     if m2:
         return (float(m2.group(1)) * 1000, float(m2.group(2)) * 1000)
+    single = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*[Kk]\s*(以下|以上)\s*', text)
+    if single:
+        value = float(single.group(1)) * 1000
+        return (0, value) if single.group(2) == '以下' else (value, float('inf'))
     return (0, 0)
 
 
@@ -302,6 +306,15 @@ def validate_config(config):
     if config['browser'].get('proxy_mode', 'system') not in ('system', 'direct'):
         raise ValueError('browser.proxy_mode 只支持 system 或 direct')
     search = config['search']
+    if search.get('source', 'boss_online') not in ('config', 'boss_online'):
+        raise ValueError('search.source 只支持 config 或 boss_online')
+    salary = search.get('salary', '')
+    if not isinstance(salary, str):
+        raise ValueError('search.salary 必须是字符串，例如 10-20K')
+    if salary.strip() not in ('', '面议', '不限'):
+        lo, hi = extract_salary_range(salary)
+        if not hi or lo > hi:
+            raise ValueError('search.salary 无法识别或区间倒置，请使用 10-20K、3K以下、50K以上等格式')
     search.setdefault('keywords', [])
     if not isinstance(search['keywords'], list) or any(not isinstance(k, str) for k in search['keywords']):
         raise ValueError('search.keywords 必须是字符串列表')
@@ -316,6 +329,9 @@ def validate_config(config):
         raise ValueError('投递间隔必须满足 0 <= min <= max')
     if not isinstance(submit['daily_limit'], int) or submit['daily_limit'] < 1:
         raise ValueError('submit.daily_limit 必须为正整数')
+    attempts = submit.get('max_attempts_per_run', 0)
+    if not isinstance(attempts, int) or attempts < 0:
+        raise ValueError('submit.max_attempts_per_run 必须为非负整数，0 表示不额外限制')
     for key in ('min_match_score', 'ai_fit_min_score', 'skip_kpi_score'):
         value = config['filter'].get(key, 50)
         if not isinstance(value, (int, float)) or not 0 <= value <= 100:

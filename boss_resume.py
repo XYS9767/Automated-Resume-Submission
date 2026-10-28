@@ -12,7 +12,7 @@ class OnlineProfile:
     targets: list[dict]
 
 
-def profile_from_data(data):
+def profile_from_data(data, use_expectations=True):
     name = str(data.get('name') or '').strip()
     sections = data.get('sections') or {}
     raw = '姓名：' + name + '\n' + '\n'.join(str(value) for value in sections.values())
@@ -25,6 +25,8 @@ def profile_from_data(data):
     resume.education = parser._parse_entries(str(sections.get('education') or '').splitlines(), 'edu')
     years = re.search(r'(\d+)年经验', str(data.get('base') or ''))
     resume.declared_experience_years = int(years.group(1)) if years else None
+    if not use_expectations:
+        return OnlineProfile(resume, [])
     targets = []
     seen = set()
     for expectation in data.get('expectations') or []:
@@ -45,7 +47,7 @@ def profile_from_data(data):
     return OnlineProfile(resume, targets)
 
 
-def read_online_profile(browser, timeout=20):
+def read_online_profile(browser, timeout=20, use_expectations=True):
     tab = browser.new_tab('https://www.zhipin.com/web/geek/resume')
     try:
         deadline = time.monotonic() + timeout
@@ -63,8 +65,9 @@ def read_online_profile(browser, timeout=20):
                         salary:e.querySelector('.money-item')?.innerText.trim() || '',
                         cities:e.querySelector('.city-item')?.innerText.trim() || ''}))};
             """) or {}
-            if data.get('name') and data.get('expectations') and data.get('sections', {}).get('work'):
-                return profile_from_data(data)
+            if (data.get('name') and data.get('sections', {}).get('work')
+                    and (data.get('expectations') or not use_expectations)):
+                return profile_from_data(data, use_expectations=use_expectations)
             time.sleep(.3)
         raise TimeoutError('未在限时内读取到已登录账号的在线简历')
     finally:

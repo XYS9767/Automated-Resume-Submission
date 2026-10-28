@@ -27,6 +27,7 @@ def diagnose(config_path='config.yaml'):
     cfg = config['resume']
     if cfg.get('source') == 'boss_online':
         print('[OK] 简历来源：当前登录 BOSS 账号的在线简历，运行时自动读取，无需本地 PDF')
+        print('[OK] 求职条件来源:', '配置文件' if config['search'].get('source') == 'config' else '在线简历期望')
     else:
         directory = resolve_path(cfg.get('resume_dir') or 'resumes')
         paths = find_all_resume_files(directory) if directory.is_dir() else []

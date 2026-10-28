@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import random
+from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -37,7 +38,7 @@ from recorder import ApplyRecorder
 class AutoBossApp:
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = load_config(config_path)
+        self.config = deepcopy(load_config(config_path))
         self.logger = get_logger("app")
         self.browser = None
         self.work_tab = None
@@ -63,17 +64,19 @@ class AutoBossApp:
                 login = BossLogin(cfg)
                 self.browser = login.login()
                 self.work_tab = login.work_tab
-                profile = read_online_profile(self.browser)
+                use_expectations = cfg['search'].get('source', 'boss_online') == 'boss_online'
+                profile = read_online_profile(self.browser, use_expectations=use_expectations)
                 self.resumes = [profile.resume]
-                cfg['search']['targets'] = profile.targets
-                cfg['search']['keywords'] = list(dict.fromkeys(t['keyword'] for t in profile.targets))
-                first = profile.targets[0]
-                cfg['search'].update(city=first['city'], city_code=first['city_code'], salary=first['salary'])
+                if use_expectations:
+                    cfg['search']['targets'] = profile.targets
+                    cfg['search']['keywords'] = list(dict.fromkeys(t['keyword'] for t in profile.targets))
+                    first = profile.targets[0]
+                    cfg['search'].update(city=first['city'], city_code=first['city_code'], salary=first['salary'])
                 years = profile.resume.declared_experience_years
                 if years is not None:
                     cfg['filter']['max_experience'] = str(years) + '年'
-                self.logger.info('使用当前 BOSS 在线简历：%s；%d 个岗位/城市组合',
-                                 profile.resume.name, len(profile.targets))
+                self.logger.info('使用当前 BOSS 在线简历：%s；求职条件来源=%s',
+                                 profile.resume.name, '在线期望' if use_expectations else '配置文件')
             else:
                 paths = self._resolve_resume_paths(resume_path)
                 if not paths:
@@ -197,8 +200,8 @@ class AutoBossApp:
                         recorder.record(job, match, risk, result, reason=submitter.last_reason,
                                         score=score, resume_name=resume_name, details=submitter.last_details)
                         stats[result] += 1
-                        if result == SubmitResult.DAILY_LIMIT:
-                            self.logger.warning("已到本地/平台沟通上限，剩余岗位已保存。")
+                        if result in (SubmitResult.DAILY_LIMIT, SubmitResult.RUN_LIMIT):
+                            self.logger.warning("已到每日或本次沟通上限，剩余岗位已保存。")
                             return 0
                         if result in (SubmitResult.LOGIN_REQUIRED, SubmitResult.SECURITY_REQUIRED):
                             return 2
@@ -263,7 +266,6 @@ class AutoBossApp:
 
     def _evaluate_job(self, job, keyword, searcher, risk_checker, matchers):
         from relevance import keyword_matches, contains_term
-        from utils import extract_salary_range
         f = self.config.get("filter", {})
         def reject(reason, result="条件不符"):
             return result, reason, None, None, None, ""
@@ -290,13 +292,9 @@ class AutoBossApp:
             return reject("标题/JD/技能均不符合搜索方向: " + keyword, "方向不符")
         if f.get("require_description", False) and len(job.description or "") < 30:
             return reject("缺少可核实岗位描述", "资料不足")
-        # Unit-aware salary filter: monthly band must not reject daily-paid internships.
-        salary_filter = self.config.get("search", {}).get("salary", "")
-        if salary_filter and "/天" not in job.salary and "元/日" not in job.salary:
-            lo, hi = extract_salary_range(salary_filter)
-            if lo and hi and job.salary_min and job.salary_max:
-                if job.salary_max < lo or job.salary_min > hi:
-                    return reject("月薪与配置区间无交集: " + job.salary)
+        salary_reason = self._salary_rejection_reason(job, self.config.get('search', {}).get('salary', ''))
+        if salary_reason:
+            return reject(salary_reason)
         if f.get("require_boss_online") and job.boss_online is not True:
             return reject("BOSS未确认在线", "BOSS不在线")
         max_rank = parse_max_boss_inactive(f.get("max_boss_inactive", ""))
@@ -333,6 +331,25 @@ class AutoBossApp:
         if score < f.get("min_match_score", 55):
             return SubmitResult.MATCH_LOW, f"规则匹配 {score:.1f} < {f.get('min_match_score', 55)}", match, risk, score, resume.parsed_from
         return None, reason, match, risk, score, resume.parsed_from
+
+    @staticmethod
+    def _salary_rejection_reason(job, salary_filter):
+        """有月薪要求时，起薪必须满足底线，不能仅凭最高薪资与目标重叠。"""
+        from utils import extract_salary_range
+        lo, hi = extract_salary_range(salary_filter)
+        if not hi:
+            return ''
+        salary = job.salary or ''
+        if any(unit in salary for unit in ('/天', '元/日', '/时', '/小时', '/年', '日薪', '时薪', '年薪')):
+            return '岗位非月薪，无法确认月薪底线: ' + salary
+        job_lo, job_hi = extract_salary_range(salary)
+        if not job_lo or not job_hi or job_lo > job_hi:
+            return '岗位薪资不明，无法确认月薪底线: ' + (salary or '未标注')
+        if job_lo < lo:
+            return '最低月薪低于配置下限: ' + salary
+        if job_lo > hi:
+            return '最低月薪超过配置上限: ' + salary
+        return ''
 
     @staticmethod
     def _parse_risk_block_levels(levels) -> set:
@@ -773,7 +790,13 @@ class AutoBossApp:
         if not max_exp or max_exp in ('不限', '经验不限'):
             return False
         caps = {'应届生': 0, '在校生': 0, '1年以内': 1, '1-3年': 3, '3-5年': 5, '5-10年': 10, '10年以上': 99}
-        cap = caps.get(max_exp, 3)
+        max_exp = str(max_exp).strip()
+        cap = caps.get(max_exp)
+        if cap is None:
+            exact = re.fullmatch(r'(\d+)\s*年', max_exp)
+            if not exact:
+                raise ValueError('无法识别经验上限: ' + max_exp)
+            cap = int(exact.group(1))
         exp = (job.experience or '').strip()
         if any(k in exp for k in ('不限', '应届', '在校', '实习')):
             return False

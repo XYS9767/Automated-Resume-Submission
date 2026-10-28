@@ -57,3 +57,9 @@ runtime_console.*.log
 代码变更.patch
 现场调试记录*.md
 *.zip
+
+# Local configuration copies and verification outputs
+config.*-test.yaml
+config.before-*.yaml
+*_test_result.json
+!packaging/config.yaml

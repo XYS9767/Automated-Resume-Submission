@@ -13,6 +13,7 @@ class SubmitResult:
     SUCCESS = '投递成功'  # 兼容旧记录，实际表示已确认发起沟通。
     SKIPPED = 'skipped'
     DAILY_LIMIT = 'daily_limit'
+    RUN_LIMIT = 'run_limit'
     ALREADY_APPLIED = 'already_applied'
     LOGIN_REQUIRED = 'login_required'
     SECURITY_REQUIRED = 'security_required'
@@ -32,6 +33,8 @@ class JobSubmitter:
         self.greeting = cfg.get('greeting', '').strip()
         self.send_greeting = cfg.get('send_greeting', True)
         self.daily_limit = int(cfg.get('daily_limit', 150))
+        self.max_attempts = int(cfg.get('max_attempts_per_run', 0))
+        self.attempt_count = 0
         self.timeout = float(cfg.get('confirm_timeout', 12))
         self.last_reason, self.last_details, self._clicked = '', {}, False
         self._state_path = resolve_path(cfg.get('state_file', 'submission_state.json'))
@@ -270,6 +273,9 @@ class JobSubmitter:
 
     def submit(self, job, match_score=0):
         self.last_reason, self.last_details, self._clicked = '', {}, False
+        if self.max_attempts and self.attempt_count >= self.max_attempts:
+            self.last_reason = '已达到本次沟通点击上限，包含结果待核实的尝试'
+            return SubmitResult.RUN_LIMIT
         if self.get_today_count() >= self.daily_limit:
             return SubmitResult.DAILY_LIMIT
         job.encrypt_job_id = job.encrypt_job_id or extract_encrypt_job_id(job.url)
@@ -312,6 +318,7 @@ class JobSubmitter:
                 # The live site prepares its chat action on mouse enter.
                 actions.move_to(button).wait(.3)
             self._clicked = True
+            self.attempt_count += 1
             clicked = actions.click() if actions is not None else button.click()
             if clicked is False:
                 self._clicked = False
