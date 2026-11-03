@@ -54,6 +54,8 @@ class AutoBossApp:
         from relevance import keyword_matches
         stats = Counter()
         recorder = None
+        submitter = None
+        initial_submission_jobs = {}
         try:
             if self._stop_requested():
                 return 0
@@ -114,10 +116,11 @@ class AutoBossApp:
             risk_checker.set_browser(self.browser)
             if cfg.get("risk_check", {}).get("company_lookup", False) and interactive:
                 self._login_aiqicha(risk_checker)
-            matchers = [JobMatcher(resume) for resume in self.resumes]
+            matchers = [JobMatcher(resume, expected_salary=cfg['search'].get('salary', '')) for resume in self.resumes]
             recorder = ApplyRecorder(cfg)
             queue = RunQueue(cfg, self.resumes)
             submitter = JobSubmitter(self.browser, cfg, self.work_tab, searcher.ensure_detail_tab)
+            initial_submission_jobs = deepcopy(submitter._state.get('jobs', {}))
             old_success = {job_url_key(r["url"]) for r in recorder._records
                            if r.get("url") and r.get("result") in ("投递成功", "已投递过", "沟通成功")}
             handled = set()
@@ -243,12 +246,17 @@ class AutoBossApp:
             self.logger.warning("已停止；已完成记录和未完成队列保留，下次运行自动续接。")
             return 130
         finally:
+            communication_summary = None
+            if not resume_only:
+                communication_summary = self._print_communication_summary(
+                    stats, submitter, initial_submission_jobs, search_only)
             if recorder:
                 recorder.save_json()
             if stats:
                 self.logger.info("本次统计: %s", dict(stats))
                 from utils import safe_save_json
-                safe_save_json({"stats": dict(stats), "time": datetime.now().isoformat()},
+                safe_save_json({"stats": dict(stats), "time": datetime.now().isoformat(),
+                                "communication_summary": communication_summary},
                                self.config.get("output", {}).get("summary_file", "last_run_summary.json"))
             if self.browser:
                 try:
@@ -257,6 +265,46 @@ class AutoBossApp:
                         self.browser.quit()
                 except Exception:
                     pass
+
+    def _print_communication_summary(self, stats, submitter=None, initial_jobs=None, search_only=False):
+        """Show this run's outcomes without counting filters as failed contacts."""
+        summary = {
+            'success': stats.get(SubmitResult.SUCCESS, 0),
+            'failed': stats.get(SubmitResult.FAILED, 0) + stats.get('job_error', 0),
+            'unconfirmed': stats.get(SubmitResult.UNCONFIRMED, 0),
+            'today_success': None,
+        }
+        # Ctrl+C can arrive after the click but before the outcome was counted.
+        # New pending ledger entries must remain visible as unconfirmed outcomes.
+        if submitter is not None:
+            initial_jobs = initial_jobs or {}
+            changed_entries = [entry for key, entry in submitter._state.get('jobs', {}).items()
+                               if entry != initial_jobs.get(key)]
+            summary['success'] = max(summary['success'], sum(
+                entry.get('status') == SubmitResult.SUCCESS for entry in changed_entries))
+            summary['unconfirmed'] = max(summary['unconfirmed'], sum(
+                entry.get('status') in ('pending', SubmitResult.UNCONFIRMED)
+                for entry in changed_entries))
+        try:
+            # Construction reads the existing state/counter, without browser access
+            # or writing either file. This also covers a stop before login.
+            counter = submitter if submitter is not None else JobSubmitter(None, self.config)
+            summary['today_success'] = counter.get_today_count()
+        except Exception as exc:
+            self.logger.warning('当天累计成功数读取失败: %s', exc)
+        total = summary['today_success']
+        mode = '预览结束（未发起沟通）' if search_only else '本次沟通汇总'
+        self.logger.info(
+            '\n========== %s ==========\n'
+            '本次沟通成功：%s 个\n'
+            '本次沟通失败：%s 个\n'
+            '本次结果待核实：%s 个\n'
+            '当天累计沟通成功（%s）：%s\n'
+            '说明：条件过滤、匹配分不足和已沟通过的岗位不计入失败；待核实不计入成功。\n'
+            '================================',
+            mode, summary['success'], summary['failed'], summary['unconfirmed'],
+            datetime.now().date().isoformat(), f'{total} 个' if total is not None else '无法读取')
+        return summary
 
     def _stop_requested(self):
         if resolve_path('stop_requested.flag').exists():
@@ -292,6 +340,11 @@ class AutoBossApp:
             return reject("标题/JD/技能均不符合搜索方向: " + keyword, "方向不符")
         if f.get("require_description", False) and len(job.description or "") < 30:
             return reject("缺少可核实岗位描述", "资料不足")
+        eligibility = [(matcher, matcher.eligibility_rejection_reason(
+            job, f.get('domestic_ecommerce_only', False))) for matcher in matchers]
+        matchers = [matcher for matcher, reason in eligibility if not reason]
+        if not matchers:
+            return reject(eligibility[0][1] if eligibility else '没有可匹配的简历', '资格不符')
         salary_reason = self._salary_rejection_reason(job, self.config.get('search', {}).get('salary', ''))
         if salary_reason:
             return reject(salary_reason)
@@ -324,12 +377,13 @@ class AutoBossApp:
             ai = risk_checker.match_job(resume.raw_text, job.to_dict())
             if ai is not None:
                 score = ai["score"]
-                reason = "; ".join(ai.get("reasons", []))
+                reason = "AI匹配；" + "; ".join(ai.get("reasons", []))
                 if not ai["fit"] or score < f.get("ai_fit_min_score", 40):
                     return SubmitResult.MATCH_LOW, reason, match, risk, score, resume.parsed_from
                 return None, reason, match, risk, score, resume.parsed_from
+            reason = '规则匹配（AI调用失败，已回退）'
         if score < f.get("min_match_score", 55):
-            return SubmitResult.MATCH_LOW, f"规则匹配 {score:.1f} < {f.get('min_match_score', 55)}", match, risk, score, resume.parsed_from
+            return SubmitResult.MATCH_LOW, f"{reason} {score:.1f} < {f.get('min_match_score', 55)}", match, risk, score, resume.parsed_from
         return None, reason, match, risk, score, resume.parsed_from
 
     @staticmethod

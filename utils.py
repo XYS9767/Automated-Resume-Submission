@@ -305,6 +305,18 @@ def validate_config(config):
         raise ValueError('resume.source 只支持 local 或 boss_online')
     if config['browser'].get('proxy_mode', 'system') not in ('system', 'direct'):
         raise ValueError('browser.proxy_mode 只支持 system 或 direct')
+    api = config['risk_check'].get('api', {})
+    if not isinstance(api, dict):
+        raise ValueError('risk_check.api 必须是 YAML 对象')
+    if 'thinking' in api and api['thinking'] not in ('enabled', 'disabled'):
+        raise ValueError('risk_check.api.thinking 只支持 enabled 或 disabled')
+    if api.get('proxy_mode', 'system') not in ('system', 'direct', 'custom'):
+        raise ValueError('risk_check.api.proxy_mode 只支持 system、direct 或 custom')
+    if api.get('proxy_mode') == 'custom':
+        from urllib.parse import urlsplit
+        proxy = urlsplit(str(api.get('proxy_url') or ''))
+        if proxy.scheme not in ('http', 'https') or not proxy.hostname:
+            raise ValueError('risk_check.api.proxy_url 必须是有效 HTTP/HTTPS 代理地址')
     search = config['search']
     if search.get('source', 'boss_online') not in ('config', 'boss_online'):
         raise ValueError('search.source 只支持 config 或 boss_online')

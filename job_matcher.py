@@ -21,10 +21,30 @@ from typing import Optional
 
 from resume_parser import ResumeData
 from job_search import JobPosting, JobSearcher
-from utils import get_logger
-from relevance import contains_term, canonical_skill, is_skill_label
+from utils import get_logger, extract_salary_range
+from relevance import contains_term, canonical_skill, is_skill_label, extract_ecommerce_skills
 
 logger = get_logger("matcher")
+
+DOMESTIC_PLATFORMS = ('京东', '淘宝', '天猫', '苏宁', '拼多多', '抖店', '抖音',
+                      '快手', '小红书', '美团', '饿了么', '唯品会')
+CROSS_BORDER_TERMS = ('跨境', '海外', '外贸', '亚马逊', 'Amazon', 'Shopee',
+                      'Lazada', 'eBay', 'Shopify', 'AliExpress', '速卖通',
+                      'Temu', 'Shein', 'TikTok', '独立站', 'Wish')
+
+
+def graduation_cohorts(text):
+    """Read explicit graduate cohorts, not arbitrary years in a job description."""
+    years = set()
+    for match in re.finditer(r'(?<!\d)((?:(?:20)?\d{2}[、/／至到~—–\-\s]*)+)届', text):
+        values = [int(v) + (2000 if len(v) == 2 else 0)
+                  for v in re.findall(r'(?:20)?\d{2}', match.group(1))]
+        if len(values) == 2 and re.search(r'[至到~—–\-]', match.group(1)):
+            years.update(range(min(values), max(values) + 1))
+        else:
+            years.update(values)
+    years.update(int(y) for y in re.findall(r'(20\d{2})年(?:的)?(?:应届)?毕业生?', text))
+    return years
 
 
 @dataclass
@@ -79,9 +99,10 @@ class JobMatcher:
         "不限": 3,
     }
 
-    def __init__(self, resume: ResumeData, weights: Optional[dict] = None):
+    def __init__(self, resume: ResumeData, weights: Optional[dict] = None, expected_salary: str = ''):
         self.resume = resume
         self.weights = weights or self.WEIGHTS.copy()
+        self.expected_salary = expected_salary
 
         # 预计算：避免每次 match() 重复计算
         self._resume_skills_lower = set(canonical_skill(s) for s in resume.skills)
@@ -114,6 +135,44 @@ class JobMatcher:
         if present and re.search(r'/|或|任选', job.title):
             return []
         return [s for s in required if s not in present]
+
+    def eligibility_rejection_reason(self, job, domestic_ecommerce_only=False):
+        """Hard eligibility checks run before scoring or AI can approve a job."""
+        text = job.title + '\n' + (job.description or '')
+        # A title's explicit cohort is the advertised role restriction. Do not
+        # broaden it with unrelated years mentioned elsewhere in the JD.
+        cohorts = graduation_cohorts(job.title) or graduation_cohorts(job.description or '')
+        if cohorts:
+            graduation_years = [self._parse_year(edu.end_date) for edu in self.resume.education]
+            graduation_years = [year for year in graduation_years if year]
+            if not graduation_years:
+                return '岗位限定毕业届别，但简历毕业年份无法确认'
+            year = max(graduation_years)
+            if year not in cohorts:
+                return f'毕业届别不符: 简历{year}届，岗位限定' + '/'.join(map(str, sorted(cohorts))) + '届'
+        if not domestic_ecommerce_only:
+            return ''
+        # Read title/JD, not company background or recommendation skill labels.
+        # Negated/optional cross-border experience is not a required direction.
+        required_description = re.sub(
+            r'(?:无需|不要求|不需要|不限|不涉及|非)[^，,。；;\n]{0,8}(?:跨境|海外|外贸)(?:电商)?(?:运营)?(?:经验)?'
+            r'|(?:跨境|海外|外贸)(?:电商)?(?:运营)?经验(?:者)?(?:优先|加分|不要求|不限)',
+            '', job.description or '')
+        direction = job.title + '\n' + required_description
+        foreign = [term for term in CROSS_BORDER_TERMS if contains_term(direction, term)]
+        if foreign:
+            return '仅匹配国内电商，岗位涉及跨境/海外方向: ' + '、'.join(foreign)
+        platforms = {canonical_skill(p) for p in DOMESTIC_PLATFORMS if contains_term(text, p)}
+        # Also recognize aliases such as 淘系 and 京东自营.
+        platforms.update(extract_ecommerce_skills(text) & set(DOMESTIC_PLATFORMS))
+        familiar = extract_ecommerce_skills(self.resume.raw_text) & set(DOMESTIC_PLATFORMS)
+        familiar.update(canonical_skill(p) for p in DOMESTIC_PLATFORMS
+                        if contains_term(self.resume.raw_text, p))
+        if not platforms:
+            return '岗位未明确国内运营平台，无法确认与简历经验相符'
+        if not platforms & familiar:
+            return '岗位平台与简历经验不符: ' + '、'.join(sorted(platforms))
+        return ''
 
     def match(self, job: JobPosting) -> MatchResult:
         """
@@ -170,13 +229,14 @@ class JobMatcher:
         # Detail requirements must augment sparse card labels, even if labels exist.
         job_skills.update(canonical_skill(s) for s in self._tech_kw_lower
                           if contains_term(job.title + ' ' + job.description, s))
+        job_skills.update(extract_ecommerce_skills(job.title + ' ' + job.description))
 
         if not job_skills:
             result.skill_score = self.weights["skill"] * 100 * 0.6
             result.match_details.append("岗位无明确技能要求，取默认分")
             return
 
-        resume_skills = resume_skills | {s for s in job_skills if contains_term(self.resume.raw_text, s)}
+        resume_skills = resume_skills | extract_ecommerce_skills(self.resume.raw_text) | {s for s in job_skills if contains_term(self.resume.raw_text, s)}
         matched = resume_skills & job_skills
         missing = job_skills - resume_skills
         ratio = len(matched) / len(job_skills) if job_skills else 0.6
@@ -246,6 +306,15 @@ class JobMatcher:
             )
 
     def _calc_salary_match(self, job: JobPosting, result: MatchResult):
+        expected_min, expected_max = extract_salary_range(self.expected_salary)
+        if expected_max:
+            job_min, job_max = extract_salary_range(job.salary)
+            if not job_min:
+                job_min, job_max = job.salary_min, job.salary_max
+            result.salary_score = self.weights['salary'] * 100 * (
+                1.0 if expected_min <= job_min <= expected_max else 0.0)
+            result.match_details.append('薪资按配置期望评估: ' + self.expected_salary)
+            return
         if job.salary_min <= 0 and job.salary_max <= 0:
             result.salary_score = self.weights["salary"] * 100 * 0.5
             return
@@ -294,6 +363,12 @@ class JobMatcher:
             return
 
         desc_lower = job.description.lower()
+        ecommerce = extract_ecommerce_skills(job.title + ' ' + job.description)
+        if '电商运营' in extract_ecommerce_skills(self.resume.raw_text) and ecommerce:
+            covered = ecommerce & extract_ecommerce_skills(self.resume.raw_text)
+            result.keyword_score = self.weights['keyword'] * 100 * len(covered) / len(ecommerce)
+            result.match_details.append(f'电商能力覆盖: {len(covered)}/{len(ecommerce)}')
+            return
         words = set(re.findall(r"[a-zA-Z\u4e00-\u9fff]+", desc_lower))
         keywords = words - self._stopwords
 
@@ -325,21 +400,29 @@ class JobMatcher:
 
     def _calculate_total_experience_years(self) -> int:
         """从简历工作经历计算总年数"""
-        total_years = 0
-        current_year = datetime.now().year
+        intervals = []
+        now = datetime.now()
+        current_month = now.year * 12 + now.month - 1
+        def month_index(value, end=False):
+            numbers = re.findall(r'\d+', str(value))
+            if not numbers:
+                return current_month if re.search(r'至今|现在|Present|Now', str(value), re.I) else None
+            month = int(numbers[1]) if len(numbers) > 1 else (12 if end else 1)
+            return int(numbers[0]) * 12 + month - 1
         for exp in self.resume.work_experiences:
-            start = self._parse_year(exp.start_date)
-            end = self._parse_year(exp.end_date)
-            if start and end:
-                total_years += max(0, end - start)
-            elif start:
-                # 至今的情况
-                total_years += max(0, current_year - start)
-
-        if total_years == 0:
-            total_years = 0
-
-        return total_years
+            start = month_index(exp.start_date)
+            end = month_index(exp.end_date, end=True)
+            if start is not None and end is not None and start <= end:
+                intervals.append((start, min(end, current_month)))
+        merged = []
+        for start, end in sorted(intervals):
+            if end < start:
+                continue
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return round(sum(end - start + 1 for start, end in merged) / 12, 2)
 
     def _parse_year(self, date_str: str) -> Optional[int]:
         """从日期字符串解析年份"""

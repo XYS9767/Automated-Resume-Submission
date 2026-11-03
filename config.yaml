@@ -72,7 +72,9 @@ risk_check:
   api:
     provider: deepseek
     token: ''
-    model: deepseek-chat
+    model: deepseek-flash
+    thinking: disabled
+    proxy_mode: system
     timeout: 20
   risk_keywords:
   - 裁员

@@ -303,7 +303,7 @@ def test_pdf_organization_date_and_role_on_separate_lines(tmp_path):
     assert result.work_experiences[0].title_or_major == "大模型应用开发工程师"
     assert result.education[0].company_or_school == "示例理工学院"
     assert JobMatcher(result)._my_edu_level == 3
-    assert JobMatcher(result)._my_exp_years == 1
+    assert JobMatcher(result)._my_exp_years == pytest.approx(16 / 12, abs=0.01)
 
 
 def test_cookie_export_uses_installed_browser_signature(config, monkeypatch):

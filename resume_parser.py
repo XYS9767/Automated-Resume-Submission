@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import resolve_path, clean_text, get_logger
-from relevance import contains_term
+from relevance import contains_term, extract_ecommerce_skills
 
 logger = get_logger("resume")
 
@@ -133,7 +133,7 @@ class ResumeParser:
     SECTION_KEYWORDS = {
         "work": [
             "工作经历", "工作经验", "项目经验", "项目经历",
-            "实习经历", "社会实践", "Work Experience",
+            "实习经历", "实习实践", "社会实践", "Work Experience",
             "WORK EXPERIENCE", "PROJECTS",
         ],
         "edu": [
@@ -149,7 +149,7 @@ class ResumeParser:
     # Supports year-only ranges and month ranges; 2021-2025 must not parse as month 20.
     _DATE_TOKEN = r"(?:19|20)\d{2}(?:\s*[年./-]\s*(?:0?[1-9]|1[0-2])(?!\d)(?:\s*月)?)?"
     DATE_RANGE_PATTERN = re.compile(
-        rf"(?<!\d)({_DATE_TOKEN})\s*[-~–—至到]\s*({_DATE_TOKEN}|至今|现在|Present|Now)(?!\d)",
+        rf"(?<!\d)({_DATE_TOKEN})\s*[-~–—至到]\s*({_DATE_TOKEN}(?:~(?:0?[1-9]|1[0-2]))?|至今|现在|Present|Now)(?!\d)",
         re.IGNORECASE,
     )
 
@@ -312,7 +312,8 @@ class ResumeParser:
         for skill in self.SKILL_KEYWORDS:
             if contains_term(text_lower, skill):
                 matched.add(skill)
-        resume.skills = sorted(matched, key=lambda s: self.SKILL_KEYWORDS.index(s) if s in self.SKILL_KEYWORDS else 999)
+        matched.update(extract_ecommerce_skills(resume.raw_text))
+        resume.skills = sorted(matched, key=lambda s: (self.SKILL_KEYWORDS.index(s) if s in self.SKILL_KEYWORDS else 999, s))
 
     def _is_section_header(self, line: str) -> Optional[str]:
         """判断一行是否为章节标题，返回章节名或 None"""
@@ -417,7 +418,11 @@ class ResumeParser:
             inline = clean_text(lines[index][:match.start()] + ' ' + lines[index][match.end():])
             previous = lines[max(0, index-2):index]
             following = lines[index+1:end]
-            org = inline
+            org = inline if re.search(organization, inline, re.I) else ''
+            if not org:
+                org = next((line for line in following[:2]
+                            if len(line) < 100 and re.search(organization, line, re.I)
+                            and not re.match(r'^\d+[.、]', line)), '')
             if not org:
                 org = next((line for line in reversed(previous)
                             if len(line) < 100 and re.search(organization, line, re.I)), '')
@@ -435,7 +440,7 @@ class ResumeParser:
                     entry.title_or_major = re.sub(r'^(?:岗位|职位|职务)[：:]\s*', '', explicit_role)
                 elif not entry.title_or_major:
                     entry.title_or_major = next((line for line in following[:2]
-                                                if len(line) < 40 and re.search(r'工程师|经理|专员|开发|运维', line)), '')
+                                                if len(line) < 40 and re.search(r'工程师|经理|专员|开发|运维|运营', line)), '')
             else:
                 entry.company_or_school = org
                 entry.title_or_major = next((line for line in [inline, *following[:3]]

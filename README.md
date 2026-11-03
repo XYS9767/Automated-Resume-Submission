@@ -78,6 +78,24 @@ filter:
 
 ## AI 与公司检查
 
+电商匹配支持京东、淘宝、天猫等平台及常用运营工具。设置 `filter.domestic_ecommerce_only: true` 后，评分前会排除跨境/海外方向、平台不明及与简历平台经验不符的岗位；该选项默认关闭，其他岗位方向不受影响。毕业届别从简历教育结束年份识别，岗位标题有明确届别时优先按标题校验。工龄按月份计算并合并重叠经历；薪资评分使用配置中的期望范围。
+
+API 网络可独立配置，不影响浏览器或系统代理：
+
+```yaml
+risk_check:
+  api:
+    provider: deepseek
+    token: ''  # 在本机填写，或使用 DEEPSEEK_API_KEY；不要提交密钥
+    model: deepseek-flash
+    thinking: disabled
+    proxy_mode: system  # system / direct / custom
+    # proxy_url: http://127.0.0.1:7890  # custom 时填写本机实际可用的端口
+    timeout: 20
+```
+
+API 连接失败会进入冷却并回退本地规则，日志保留原始异常。记录中的“AI匹配”和“AI调用失败，已回退”可用于区分评分来源。修改网络或模型配置后需重启程序生效。
+
 `risk_check.api.token` 留空时使用本地规则。需要 AI 匹配时，配置有效的 DeepSeek Key，或设置环境变量 `DEEPSEEK_API_KEY`。模型和兼容 API 地址可用 `model`、`base_url` 配置。
 
 AI 只对选中的一份完整简历评分，避免拼接多份简历造成虚假匹配。选中的文件名写入记录；它不会因此自动上传到网站。
@@ -85,6 +103,8 @@ AI 只对选中的一份完整简历评分，避免拼接多份简历造成虚�
 默认关闭爱企查浏览器检索，可用 `risk_check.company_lookup: true` 开启。没有获取到实际企业资料时使用本地风险规则；本版不把凭公司名推断标为“已联网查证”。
 
 ## 中断、记录与结果含义
+
+正常结束、停止请求或 Ctrl+C 中断时，控制台会显示本次沟通成功、失败、待核实，以及当天累计成功数。筛选跳过和已沟通过的岗位不计入失败，待核实不计入成功。预览模式明确标注未发起沟通；当天计数读取失败时显示“无法读取”。最近一次汇总同时写入 `last_run_summary.json` 的 `communication_summary` 字段。
 
 - `apply_record.json` / `submit_log.csv`：处理结果、跳过原因、匹配分、简历文件和来源关键词。
 - `pending_jobs.json`：未完成岗位队列；下次运行先合并已有待办。

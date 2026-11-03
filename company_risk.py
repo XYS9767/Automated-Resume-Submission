@@ -136,6 +136,17 @@ class CompanyRiskChecker:
             logger.warning('没有有效 API Key，自动使用本地匹配/风险规则，不逐岗请求占位密钥。')
 
         self._session = requests.Session()
+        proxy_mode = self.api_cfg.get('proxy_mode', 'system')
+        if proxy_mode not in ('system', 'direct', 'custom'):
+            raise ValueError('risk_check.api.proxy_mode 只支持 system、direct 或 custom')
+        self._session.trust_env = proxy_mode == 'system'
+        if proxy_mode == 'custom':
+            from urllib.parse import urlsplit
+            proxy_url = str(self.api_cfg.get('proxy_url') or '')
+            parsed_proxy = urlsplit(proxy_url)
+            if parsed_proxy.scheme not in ('http', 'https') or not parsed_proxy.hostname:
+                raise ValueError('risk_check.api.proxy_url 必须是有效 HTTP/HTTPS 代理地址')
+            self._session.proxies.update(http=proxy_url, https=proxy_url)
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
@@ -148,6 +159,11 @@ class CompanyRiskChecker:
         self._aiqicha_last_at = 0.0
 
         logger.info(f"风险检测模式: {self.mode}")
+        if self.mode == 'api':
+            logger.info('API 网络模式: %s', {
+                'direct': '直连（不使用系统或环境代理）',
+                'custom': '独立指定代理（不使用系统或环境代理）',
+                'system': '系统/环境代理'}[proxy_mode])
 
     @property
     def ai_available(self):
@@ -160,6 +176,8 @@ class CompanyRiskChecker:
         kwargs['timeout'] = (5, self.api_cfg.get('timeout', 20))
         kwargs['json']['model'] = self.api_cfg.get('model', 'deepseek-chat')
         kwargs['json']['response_format'] = {'type': 'json_object'}
+        if 'thinking' in self.api_cfg:
+            kwargs['json']['thinking'] = {'type': self.api_cfg['thinking']}
         url = self.api_cfg.get('base_url', 'https://api.deepseek.com/v1').rstrip('/') + '/chat/completions'
         try:
             response = self._session.post(url, **kwargs)
@@ -773,12 +791,18 @@ class CompanyRiskChecker:
                 return {"score": score, "fit": fit, "reasons": reasons, "missing": missing}
             except Exception as e:
                 last_err = e
+                if not self.ai_available:
+                    # A request failure starts a cooldown. Retrying immediately
+                    # would replace the real timeout/HTTP error with "unavailable".
+                    break
                 if attempt < 1 and self.ai_available:
                     import time as _time
-                    logger.warning(f"  AI匹配重试({attempt + 1}/3): {e}")
+                    logger.warning('  AI匹配重试(%s/2): %s', attempt + 1,
+                                   str(e).replace(token, '[REDACTED]'))
                     _time.sleep(2 + attempt * 2)
                     continue
-        logger.error(f"AI匹配失败: {last_err}")
+        logger.error('AI匹配失败（%s），回退本地规则: %s', type(last_err).__name__,
+                     str(last_err).replace(token, '[REDACTED]'))
         return None
 
     # ==================== 简历分析 → 搜索关键词（DeepSeek） ====================
