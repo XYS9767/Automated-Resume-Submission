@@ -33,6 +33,8 @@ from company_risk import CompanyRiskChecker, RiskLevel, RiskResult
 from job_matcher import JobMatcher
 from submitter import JobSubmitter, SubmitResult
 from recorder import ApplyRecorder
+from access_safety import AccessGuard, AccessStopped
+from evaluation_cache import EvaluationCache
 
 
 class AutoBossApp:
@@ -56,18 +58,23 @@ class AutoBossApp:
         recorder = None
         submitter = None
         initial_submission_jobs = {}
+        guard = None
         try:
             if self._stop_requested():
                 return 0
             cfg = self.config
+            if not resume_only or cfg.get('resume', {}).get('source') == 'boss_online':
+                guard = AccessGuard(cfg)
+                guard.check()
             online = cfg.get('resume', {}).get('source') == 'boss_online' and not resume_path
             if online:
                 from boss_resume import read_online_profile
                 login = BossLogin(cfg)
+                login.guard = guard
                 self.browser = login.login()
                 self.work_tab = login.work_tab
                 use_expectations = cfg['search'].get('source', 'boss_online') == 'boss_online'
-                profile = read_online_profile(self.browser, use_expectations=use_expectations)
+                profile = read_online_profile(self.browser, use_expectations=use_expectations, guard=guard)
                 self.resumes = [profile.resume]
                 if use_expectations:
                     cfg['search']['targets'] = profile.targets
@@ -110,16 +117,21 @@ class AutoBossApp:
                              filter_cfg.get("max_boss_inactive") or "不限")
             if self.browser is None:
                 login = BossLogin(cfg)
+                login.guard = guard
                 self.browser = login.login()
                 self.work_tab = login.work_tab
             searcher = self._searcher = JobSearcher(self.browser, cfg)
+            searcher.guard = guard
             risk_checker.set_browser(self.browser)
             if cfg.get("risk_check", {}).get("company_lookup", False) and interactive:
                 self._login_aiqicha(risk_checker)
             matchers = [JobMatcher(resume, expected_salary=cfg['search'].get('salary', '')) for resume in self.resumes]
             recorder = ApplyRecorder(cfg)
             queue = RunQueue(cfg, self.resumes)
+            cache = EvaluationCache(cfg, self.resumes)
+            searcher.cache = cache
             submitter = JobSubmitter(self.browser, cfg, self.work_tab, searcher.ensure_detail_tab)
+            submitter.guard = guard
             initial_submission_jobs = deepcopy(submitter._state.get('jobs', {}))
             old_success = {job_url_key(r["url"]) for r in recorder._records
                            if r.get("url") and r.get("result") in ("投递成功", "已投递过", "沟通成功")}
@@ -151,6 +163,9 @@ class AutoBossApp:
                             stats["search_error"] += 1
                             return 2
                         break
+                    except AccessStopped:
+                        queue.add(scope, getattr(searcher, "partial_jobs", []))
+                        raise
                     except Exception as exc:
                         self.logger.warning("搜索失败 (%s)，尝试恢复标签页", type(exc).__name__)
                         if attempt == 0:
@@ -174,13 +189,20 @@ class AutoBossApp:
                         queue.done(scope, job)
                         continue
                     try:
+                        cached = cache.rejection(job, keyword, searcher.city, cfg['search'].get('salary', ''))
+                        if cached:
+                            stats['cached_rejection'] += 1
+                            queue.done(scope, job)
+                            continue
                         decision = self._evaluate_job(job, keyword, searcher, risk_checker, matchers)
                         result, reason, match, risk, score, resume_name = decision
                         if result:
+                            cache.save_rejection(job, keyword, searcher.city, cfg['search'].get('salary', ''), result, reason)
                             recorder.record(job, match, risk, result, reason=reason, score=score, resume_name=resume_name)
                             stats[result] += 1
                             # A mismatch on this keyword can still fit a later keyword.
-                            queue.done(scope, job)
+                            if result != '详情未核实':
+                                queue.done(scope, job)
                             continue
                         if search_only:
                             recorder.record(job, match, risk, "预览通过", reason="满足配置条件", score=score, resume_name=resume_name)
@@ -192,14 +214,7 @@ class AutoBossApp:
                             return 0
                         result = submitter.submit(job, score)
                         if result in (SubmitResult.LOGIN_REQUIRED, SubmitResult.SECURITY_REQUIRED):
-                            recorder.record(job, match, risk, result, reason=submitter.last_reason, score=score, resume_name=resume_name)
-                            page = searcher.ensure_detail_tab()
-                            if wait_user_clear_security(page, self.logger,
-                                    timeout=cfg.get("runtime", {}).get("security_wait_seconds", 180),
-                                    ready=lambda page: submitter._tab_has_job(page, job.encrypt_job_id)):
-                                result = submitter.submit(job, score)
-                            else:
-                                return 2
+                            guard.stop("沟通遇到登录或安全验证，停止本次运行；请手动核实后重新启动。")
                         recorder.record(job, match, risk, result, reason=submitter.last_reason,
                                         score=score, resume_name=resume_name, details=submitter.last_details)
                         stats[result] += 1
@@ -235,6 +250,8 @@ class AutoBossApp:
                         if result != SubmitResult.ALREADY_APPLIED:
                             interval = cfg.get("submit", {}).get("interval", {"min": 8, "max": 20})
                             time.sleep(random.uniform(interval["min"], interval["max"]))
+                    except AccessStopped:
+                        raise
                     except Exception as exc:
                         self.logger.exception("单岗处理失败，保留待重试: %s", job.title)
                         recorder.record(job, submit_result=SubmitResult.FAILED,
@@ -242,6 +259,10 @@ class AutoBossApp:
                         stats["job_error"] += 1
                         # Keep queue entry, continue other jobs rather than abort entire run.
             return 0
+        except AccessStopped as exc:
+            self.logger.warning("访问已停止：%s", exc)
+            stats["access_stopped"] += 1
+            return 2
         except KeyboardInterrupt:
             self.logger.warning("已停止；已完成记录和未完成队列保留，下次运行自动续接。")
             return 130
@@ -331,11 +352,16 @@ class AutoBossApp:
             return reject("仅选择实习岗位")
         if f.get('job_type') == 'fulltime' and any(w in job.title + job.experience for w in ('实习', '在校', '兼职')):
             return reject('在线简历只选择全职岗位')
+        salary_reason = self._salary_rejection_reason(job, self.config.get('search', {}).get('salary', ''))
+        if salary_reason:
+            return reject(salary_reason)
         need_relevance = not keyword_matches(job.title, keyword, job.description, job.skills_required)
         need_desc = len(job.description or "") < 30
         need_boss = bool(f.get("require_boss_online") or f.get("max_boss_inactive"))
         if need_relevance or need_desc or (need_boss and self._needs_boss_detail(job, f.get("require_boss_online"))):
             searcher.fetch_job_detail(self.work_tab, job, need_description=True, need_boss_status=need_boss)
+            if getattr(job, 'detail_unverified', False):
+                return reject('无法确认详情，保留队列，不使用列表资料发起沟通', '详情未核实')
         if not keyword_matches(job.title, keyword, job.description, job.skills_required):
             return reject("标题/JD/技能均不符合搜索方向: " + keyword, "方向不符")
         if f.get("require_description", False) and len(job.description or "") < 30:
@@ -345,9 +371,6 @@ class AutoBossApp:
         matchers = [matcher for matcher, reason in eligibility if not reason]
         if not matchers:
             return reject(eligibility[0][1] if eligibility else '没有可匹配的简历', '资格不符')
-        salary_reason = self._salary_rejection_reason(job, self.config.get('search', {}).get('salary', ''))
-        if salary_reason:
-            return reject(salary_reason)
         if f.get("require_boss_online") and job.boss_online is not True:
             return reject("BOSS未确认在线", "BOSS不在线")
         max_rank = parse_max_boss_inactive(f.get("max_boss_inactive", ""))
@@ -488,9 +511,12 @@ class AutoBossApp:
             pass
         try:
             # 先落到配置城市站，减少 /qingdao/ 首页干扰
+            searcher.guard.before("city", tab)
             tab.get(f"https://www.zhipin.com/web/geek/job?city={code}")
             tab.wait(2)
             self.logger.info(f"  🌏 已切换到配置城市：{city} ({code})")
+        except AccessStopped:
+            raise
         except Exception as e:
             self.logger.warning(f"  ⚠️ 切换城市失败: {e}")
 
@@ -534,6 +560,7 @@ class AutoBossApp:
         entry = next((e for e in inputs if e.states.is_displayed), None)
         if not entry:
             return False
+        self._searcher.guard.before("ui_search", tab)
         entry.input(keyword, clear=True)
         buttons = tab.eles('css:button.btn-search, .btn-search, .search-btn, button[ka*="search"]')
         button = next((e for e in buttons if e.states.is_displayed), None)
@@ -552,20 +579,25 @@ class AutoBossApp:
                 if "zhipin.com" in u:
                     self.work_tab = t
                     return t
+            self._searcher.guard.before("recover_tab")
             self.work_tab = self.browser.new_tab("https://www.zhipin.com")
             self.work_tab.wait(3)
             return self.work_tab
+        except AccessStopped:
+            raise
         except Exception as e:
             self.logger.error(f"  ❌ 无法恢复工作标签页: {e}")
             return None
 
     def _scroll(self, tab):
+        self._searcher.guard.before("scroll", tab)
         for _ in range(3):
             try: tab.run_js("window.scrollBy(0, 500)")
             except: pass
             time.sleep(0.3)
 
     def _scroll_bottom(self, tab):
+        self._searcher.guard.before("scroll_page", tab)
         try: tab.run_js("window.scrollTo(0, document.body.scrollHeight)")
         except: pass
         time.sleep(2)
@@ -599,12 +631,6 @@ class AutoBossApp:
             elif aiqicha_tab:
                 try:
                     aiqicha_tab.close()
-                except Exception:
-                    pass
-            if self.work_tab:
-                try:
-                    self.work_tab.get("https://www.zhipin.com/web/geek/job")
-                    self.work_tab.wait(1)
                 except Exception:
                     pass
 

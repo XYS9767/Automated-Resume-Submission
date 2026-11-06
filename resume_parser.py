@@ -132,10 +132,12 @@ class ResumeParser:
     # 章节关键词（支持多种写法；长关键词优先，避免「教育」误匹配）
     SECTION_KEYWORDS = {
         "work": [
-            "工作经历", "工作经验", "项目经验", "项目经历",
+            "工作经历", "工作经验",
             "实习经历", "实习实践", "社会实践", "Work Experience",
-            "WORK EXPERIENCE", "PROJECTS",
+            "WORK EXPERIENCE",
         ],
+        "projects": ["项目经验", "项目经历", "项目实践", "Projects", "PROJECTS", "Project Experience"],
+        "summary": ["自我评价", "个人总结", "个人优势", "自我介绍"],
         "edu": [
             "教育背景", "教育经历", "学习经历", "学历",
             "Education", "EDUCATION",
@@ -187,7 +189,7 @@ class ResumeParser:
 
         # 如果结构化提取的工作经历为空，走全文本兜底
         if len(resume.work_experiences) == 0 and not any(
-            self._detect_section(line) == 'work' for line in raw_text.splitlines()
+            self._detect_section(line) in ('work', 'projects') for line in raw_text.splitlines()
         ):
             self.logger.info("结构化提取工作经历为 0，尝试全局扫描...")
             self._parse_work_experiences(resume, raw_text.split("\n"))
@@ -321,8 +323,6 @@ class ResumeParser:
         if not stripped or len(stripped) > 20:
             return None
         for section, keywords in self.SECTION_KEYWORDS.items():
-            if section == "skills_section":
-                continue
             for kw in sorted(keywords, key=len, reverse=True):
                 if stripped == kw or stripped.replace(" ", "") == kw:
                     return section
@@ -335,8 +335,6 @@ class ResumeParser:
         if header:
             return header
         for section, keywords in self.SECTION_KEYWORDS.items():
-            if section == "skills_section":
-                continue
             for kw in sorted(keywords, key=len, reverse=True):
                 if kw in stripped and len(stripped) <= len(kw) + 4:
                     return section
@@ -410,6 +408,7 @@ class ResumeParser:
         """Associate adjacent organization, date, role and degree lines in PDF text."""
         entries = []
         lines = [re.sub(r'^[\uf06c\u2022●•·*]\s*', '', str(line).strip()) for line in lines]
+        lines = [self._expand_short_month_range(line) for line in lines]
         anchors = [(i, self.DATE_RANGE_PATTERN.search(line)) for i, line in enumerate(lines)]
         anchors = [(i, m) for i, m in anchors if m]
         organization = r'大学|学院|学校|University|College' if kind == 'edu' else r'公司|集团|研究院|事务所|工作室|Corporation|Ltd|Inc'
@@ -451,6 +450,21 @@ class ResumeParser:
             entry.description = ' '.join(line for line in following if line and line != org)
             entries.append(entry)
         return entries
+
+    @staticmethod
+    def _expand_short_month_range(line):
+        """Expand unambiguous same-year ranges such as 2026.3-5.
+
+        A hyphen-only ISO date (2026-03-05) is not a month range. Do not
+        infer a following year when the abbreviated end month precedes the start.
+        """
+        pattern = r'(?<!\d)((?:19|20)\d{2})\s*[年./]\s*(0?[1-9]|1[0-2])\s*月?\s*[-~–—至到]\s*(0?[1-9]|1[0-2])(?:\s*月)?(?![\d./-])'
+        def expand(match):
+            year, start, end = match.groups()
+            if int(end) < int(start):
+                return match.group()
+            return f'{year}.{int(start)}-{year}.{int(end)}'
+        return re.sub(pattern, expand, line)
 
     def _parse_work_experiences(self, resume, lines):
         resume.work_experiences.extend(self._parse_entries(lines, 'work'))

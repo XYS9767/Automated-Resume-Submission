@@ -16,6 +16,8 @@ logger = get_logger('login')
 
 class BossLogin:
     def __init__(self, config):
+        from access_safety import AccessGuard
+        self.guard = AccessGuard(config)
         self.cfg = config
         self.browser, self.work_tab = None, None
         self._edge_process = None
@@ -123,14 +125,17 @@ class BossLogin:
         tabs = self.browser.get_tabs()
         self.work_tab = next((t for t in tabs if urlsplit(t.url).hostname in ('www.zhipin.com', 'zhipin.com')), None)
         if self.work_tab is None:
+            self.guard.before('login_page')
             self.work_tab = self.browser.new_tab('https://www.zhipin.com')
         if self.cfg.get('login', {}).get('method') == 'cookie' and self.cookie_file.exists():
             cookies = json.loads(self.cookie_file.read_text(encoding='utf-8'))
             cookies = [c for c in cookies if str(c.get('domain', '')).lstrip('.') in ('zhipin.com', 'www.zhipin.com')]
             self.work_tab.set.cookies(cookies)
+            self.guard.before('cookie_refresh', self.work_tab)
             self.work_tab.refresh()
 
     def _wait_for_user_login(self):
+        self.guard.inspect(self.work_tab)
         if is_boss_logged_in_visually(self.work_tab) and not is_boss_security_page(self.work_tab, strict=True):
             logger.info('已恢复登录，自动继续。')
             return
@@ -138,6 +143,7 @@ class BossLogin:
         timeout = self.cfg.get('login', {}).get('wait_seconds', 180)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self.guard.inspect(self.work_tab)
             if not is_boss_security_page(self.work_tab, strict=True) and is_boss_logged_in_visually(self.work_tab):
                 logger.info('已检测到登录。')
                 return
@@ -145,6 +151,7 @@ class BossLogin:
         raise TimeoutError(f'等待登录超时（{timeout}秒）；请登录后重新运行，登录状态会保留。')
 
     def login(self):
+        self.guard.check()
         self._ensure_browser()
         self._wait_for_user_login()
         try:

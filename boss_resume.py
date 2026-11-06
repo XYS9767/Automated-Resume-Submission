@@ -47,11 +47,15 @@ def profile_from_data(data, use_expectations=True):
     return OnlineProfile(resume, targets)
 
 
-def read_online_profile(browser, timeout=20, use_expectations=True):
+def read_online_profile(browser, timeout=20, use_expectations=True, guard=None):
+    if guard is not None:
+        guard.before('online_resume')
     tab = browser.new_tab('https://www.zhipin.com/web/geek/resume')
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if guard is not None:
+                guard.inspect(tab)
             if is_boss_security_page(tab, strict=True):
                 raise RuntimeError('在线简历页面需要网站验证')
             data = tab.run_js("""

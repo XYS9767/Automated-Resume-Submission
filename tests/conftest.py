@@ -10,6 +10,10 @@ def config(tmp_path):
                    "confirm_timeout": .03, "send_greeting": False},
         "risk_check": {"mode": "rule"},
         "resume": {}, "browser": {}, "login": {}, "runtime": {},
+        "safety": {"state_file": str(tmp_path / "access.json"), "min_interval_seconds": 0,
+                   "max_actions_per_run": 10000, "max_actions_per_day": 10000},
+        "cache": {"file": str(tmp_path / "evaluations.json")},
         "output": {"log_file": str(tmp_path / "log.csv"), "record_file": str(tmp_path / "records.json"),
-                   "queue_file": str(tmp_path / "queue.json")}
+                   "queue_file": str(tmp_path / "queue.json"),
+                   "summary_file": str(tmp_path / "summary.json")}
     }

@@ -1,4 +1,5 @@
 """页面投递：精确岗位身份、确认结果、持久化防重发。"""
+from access_safety import AccessGuard, AccessStopped
 import json
 import time
 from datetime import date, datetime
@@ -26,6 +27,7 @@ class SubmitResult:
 
 class JobSubmitter:
     def __init__(self, browser, config, work_tab=None, get_detail_tab=None):
+        self.guard = AccessGuard(config)
         self.browser, self.cfg, self.work_tab = browser, config, work_tab
         self._get_detail_tab_fn = get_detail_tab
         self._detail_tab = None
@@ -98,7 +100,9 @@ class JobSubmitter:
     def _open_job_detail(self, tab, job):
         if self._tab_has_job(tab, job.encrypt_job_id):
             return True
+        self.guard.before("contact_detail", tab)
         tab.get(job.url)
+        self.guard.inspect(tab)
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             if is_boss_security_page(tab, strict=True):
@@ -111,6 +115,7 @@ class JobSubmitter:
         return False
 
     def _page_state(self, tab):
+        self.guard.inspect(tab)
         if is_boss_security_page(tab, strict=True):
             return SubmitResult.SECURITY_REQUIRED
         if any(x in urlsplit(tab.url).path for x in ('/login', '/passport')):
@@ -224,7 +229,9 @@ class JobSubmitter:
                 if (urlsplit(destination).hostname == 'www.zhipin.com'
                         and urlsplit(destination).path == '/web/geek/chat'
                         and extract_encrypt_job_id(destination) == job.encrypt_job_id):
+                    self.guard.before("chat_page", tab)
                     tab.get(destination)
+                    self.guard.inspect(tab)
                     break
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
@@ -261,6 +268,9 @@ class JobSubmitter:
             return '未发送：发送按钮尚不可用'
         if not self._tab_has_job(tab, job.encrypt_job_id):
             return '未发送：会话已切换'
+        self.guard.before("greeting", tab)
+        if not self._tab_has_job(tab, job.encrypt_job_id):
+            return "未发送：等待期间会话已切换"
         tab.actions.move_to(button).click()
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:
@@ -312,6 +322,9 @@ class JobSubmitter:
             tab.listen.start('/wapi/zpgeek/friend/add.json')
             enable_durable_responses(tab.listen)
             listening = True
+            self.guard.before('contact', tab)
+            if not self._tab_has_job(tab, job.encrypt_job_id):
+                raise AccessStopped('等待期间岗位已切换，停止沟通。')
             self._mark(job, 'pending', '即将点击沟通')
             actions = getattr(tab, 'actions', None)
             if actions is not None:
@@ -337,12 +350,16 @@ class JobSubmitter:
                 if self.send_greeting and self.greeting:
                     try:
                         self.last_details['greeting'] = self._send_greeting(tab, job)
+                    except AccessStopped:
+                        raise
                     except Exception:
                         self.last_details['greeting'] = '沟通成功，自定义招呼发送失败'
                 logger.info('已确认沟通成功 %s/%s', self.get_today_count(), self.daily_limit)
             else:
                 self._mark(job, result, self.last_reason)
             return result
+        except AccessStopped:
+            raise
         except Exception as exc:
             result = SubmitResult.UNCONFIRMED if self._clicked else SubmitResult.FAILED
             self.last_reason = f'{type(exc).__name__}: {exc}'[:300]

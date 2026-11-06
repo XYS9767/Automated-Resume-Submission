@@ -297,10 +297,23 @@ def find_all_resume_files(base_dir: Optional[Path] = None) -> list[Path]:
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError('配置必须是 YAML 对象')
-    for key in ('browser', 'login', 'resume', 'search', 'filter', 'submit', 'risk_check', 'output', 'runtime'):
+    for key in ('browser', 'login', 'resume', 'search', 'filter', 'submit', 'risk_check', 'output', 'runtime', 'safety', 'cache'):
         config.setdefault(key, {})
         if not isinstance(config[key], dict):
             raise ValueError(key + ' 必须是 YAML 对象')
+    import math
+    for key, default in (('max_actions_per_run', 60), ('max_actions_per_day', 120), ('max_detail_failures', 2)):
+        value = config['safety'].get(key, default)
+        if type(value) is not int or value < 1:
+            raise ValueError('safety.' + key + ' 必须为正整数')
+    if type(config['safety'].get('paused', False)) is not bool:
+        raise ValueError('safety.paused 必须为 true 或 false')
+    for section, key, default, minimum in (('safety', 'min_interval_seconds', 15, 0),
+                                          ('cache', 'detail_ttl_seconds', 3600, 1),
+                                          ('cache', 'rejection_ttl_seconds', 86400, 1)):
+        value = config[section].get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
+            raise ValueError(section + '.' + key + ' 必须是有效的秒数')
     if config['resume'].get('source', 'local') not in ('local', 'boss_online'):
         raise ValueError('resume.source 只支持 local 或 boss_online')
     if config['browser'].get('proxy_mode', 'system') not in ('system', 'direct'):

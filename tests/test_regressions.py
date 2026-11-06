@@ -14,6 +14,7 @@ from company_risk import CompanyRiskChecker
 from recorder import ApplyRecorder
 from run_queue import RunQueue
 from utils import safe_save_json, validate_config
+from access_safety import AccessStopped
 
 
 
@@ -105,7 +106,7 @@ def test_listener_rejects_stale_queries_wrong_cities_and_recommendations(config)
 def test_second_page_is_collected_and_listener_starts_before_navigation(config, monkeypatch):
     s = JobSearcher(None, config)
     events = []
-    tab = NS(listen=NS(start=lambda *a: events.append("listen"), stop=lambda: events.append("stop")))
+    tab = NS(url="about:blank", run_js=Mock(return_value=""), listen=NS(start=lambda *a: events.append("listen"), stop=lambda: events.append("stop")))
     batches = iter([[job("a")], [job("a"), job("b")]])
     def wait(*args, **kw):
         batch = next(batches)
@@ -139,7 +140,7 @@ def test_same_title_wrong_id_never_reuses_detail():
 def mocked_submitter(config, monkeypatch, result):
     sub = JobSubmitter(None, config)
     listener = NS(start=Mock(), stop=Mock())
-    tab = NS(url=job().url, listen=listener)
+    tab = NS(url=job().url, run_js=Mock(return_value=""), listen=listener)
     button = NS(click=Mock())
     monkeypatch.setattr(sub, "_get_detail_tab", lambda: tab)
     monkeypatch.setattr(sub, "_open_job_detail", lambda *a: True)
@@ -342,6 +343,12 @@ def test_search_post_form_and_unavailable_body_are_not_zero_jobs(config, body, e
     packets = [p]
     tab = NS(listen=NS(wait=lambda **kw: packets.pop(0) if packets else False))
     s = JobSearcher(None, config)
+    if expected == 'security':
+        with pytest.raises(AccessStopped):
+            s.wait_capture(tab, "RAG", timeout=.01)
+        assert s.guard.session_stop
+        assert not s.guard.path.exists()
+        return
     assert s.wait_capture(tab, "RAG", timeout=.01) == []
     assert s.capture_status == expected
     assert s.capture_reason
@@ -359,18 +366,19 @@ def test_security_redirect_still_consumes_the_actual_search_error(config, monkey
     s = JobSearcher(None, config)
     p = packet(query="RAG", code=37)
     packets = [p]
-    tab = NS(listen=NS(start=Mock(), stop=Mock(), wait=lambda **kw: packets.pop(0) if packets else False))
+    tab = NS(url="about:blank", run_js=Mock(return_value=""), listen=NS(start=Mock(), stop=Mock(), wait=lambda **kw: packets.pop(0) if packets else False))
     monkeypatch.setattr("job_search.is_boss_security_page", lambda *a, **k: True)
     def trigger(*args):
         s.capture_status = 'redirected'
         s.capture_reason = 'home'
         return False
-    assert s.collect_search_results(tab, "RAG", trigger) == []
-    assert s.capture_status == 'security'
-    assert 'code=37' in s.capture_reason
+    with pytest.raises(AccessStopped):
+        s.collect_search_results(tab, "RAG", trigger)
+    assert s.guard.session_stop
+    assert not json.loads(s.guard.path.read_text(encoding='utf-8')).get('blocked_reason')
 
 
-def test_automatic_search_retries_after_home_recovery_and_merges_pending(config, monkeypatch):
+def test_search_security_stops_without_auto_recovery(config, monkeypatch):
     s = JobSearcher(None, config)
     states = iter([('security', [job('a')]), ('ok', [job('a'), job('b')])])
     def collect(tab, keyword, trigger):
@@ -380,13 +388,13 @@ def test_automatic_search_retries_after_home_recovery_and_merges_pending(config,
     monkeypatch.setattr(s, 'collect_search_results', collect)
     wait = Mock(return_value=True)
     monkeypatch.setattr('job_search.wait_user_clear_security', wait)
-    result = s.search_with_recovery(NS(), 'RAG', Mock())
-    assert [j.encrypt_job_id for j in result] == ['a', 'b']
-    assert collect.call_count == 2
-    assert 'ready' not in wait.call_args.kwargs  # Never wait for the user to search.
+    with pytest.raises(AccessStopped):
+        s.search_with_recovery(NS(), 'RAG', Mock())
+    assert collect.call_count == 1
+    wait.assert_not_called()
 
 
-def test_persistent_security_has_one_bounded_search_retry(config, monkeypatch):
+def test_persistent_security_has_no_search_retry(config, monkeypatch):
     s = JobSearcher(None, config)
     def collect(*args):
         s.capture_status, s.capture_reason = 'security', 'code=37'
@@ -395,20 +403,22 @@ def test_persistent_security_has_one_bounded_search_retry(config, monkeypatch):
     monkeypatch.setattr(s, 'collect_search_results', collect)
     wait = Mock(return_value=True)
     monkeypatch.setattr('job_search.wait_user_clear_security', wait)
-    assert not s.search_with_recovery(NS(), 'RAG', Mock())
-    assert collect.call_count == 2
-    assert wait.call_count == 1
+    with pytest.raises(AccessStopped):
+        s.search_with_recovery(NS(), 'RAG', Mock())
+    assert collect.call_count == 1
+    wait.assert_not_called()
     assert s.capture_status == 'security'
 
 
 def test_interactive_verification_is_not_navigated_away(config, monkeypatch):
     s = JobSearcher(None, config)
-    tab = NS(get=Mock(), listen=NS(start=Mock(), stop=Mock(), wait=lambda **kw: False))
+    tab = NS(url="about:blank", run_js=Mock(return_value=""), get=Mock(), listen=NS(start=Mock(), stop=Mock(), wait=lambda **kw: False))
     monkeypatch.setattr('main.is_boss_security_page', lambda *a, **kw: True)
     monkeypatch.setattr(s, 'wait_capture', Mock(return_value=[]))
     monkeypatch.setattr('job_search.wait_user_clear_security', Mock(return_value=False))
     app = AutoBossApp.__new__(AutoBossApp)
-    assert not s.search_with_recovery(tab, 'RAG', app._trigger_search)
+    with pytest.raises(AccessStopped):
+        s.search_with_recovery(tab, 'RAG', app._trigger_search)
     tab.get.assert_not_called()
 
 

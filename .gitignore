@@ -45,6 +45,9 @@ submission_state.json
 pending_jobs.json
 last_run_summary.json
 runtime.log
+access_state.json
+access_state.json.lock
+evaluation_cache.json
 .auto_boss.lock
 *.tmp
 

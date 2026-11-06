@@ -15,7 +15,8 @@ from utils import extract_salary_range, validate_config
 
 class SecurityDetectionTests(unittest.TestCase):
     def tab(self, url, controls=False, body='运维工程师 岗位详情'):
-        return SimpleNamespace(url=url, run_js=Mock(side_effect=[controls, body]))
+        return SimpleNamespace(url=url, run_js=Mock(return_value={
+            'body': body, 'notices': '', 'content': False, 'challenge': controls}))
 
     def test_completed_verification_query_does_not_block(self):
         tab = self.tab('https://www.zhipin.com/web/geek/jobs?_security_check=token')
@@ -52,6 +53,11 @@ class SearchPreferenceTests(unittest.TestCase):
         return cfg
 
     def run_resume_only(self, cfg):
+        cfg = copy.deepcopy(cfg)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        cfg['safety']['state_file'] = str(Path(directory.name) / 'access.json')
+        cfg['output']['summary_file'] = str(Path(directory.name) / 'summary.json')
         resume = ResumeData(name='测试用户', raw_text='Linux Docker 运维',
                             declared_experience_years=5)
         profile = OnlineProfile(resume, [{'keyword': '运维工程师', 'city': '武汉',
@@ -167,7 +173,10 @@ class SubmissionLimitTests(unittest.TestCase):
                               'send_greeting': False,
                               'state_file': str(Path(directory) / 'state.json'),
                               'counter_file': str(Path(directory) / 'count.json')}}
+            cfg['safety'] = {'state_file': str(Path(directory) / 'access.json'), 'min_interval_seconds': 0}
             tab = Mock()
+            tab.url = 'https://www.zhipin.com/job_detail/abc.html'
+            tab.run_js.return_value = ''
             submitter = JobSubmitter(Mock(), cfg, get_detail_tab=lambda: tab)
             job = JobPosting(title='运维工程师', url='https://www.zhipin.com/job_detail/abc.html',
                              encrypt_job_id='abc')

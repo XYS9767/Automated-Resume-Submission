@@ -132,10 +132,17 @@ class ApplyRecorder:
         self._append_csv(record)
         self.save_json()
 
+        match_score = record.get('match_score')
+        score_label = '未评分' if match_score in ('', None) else str(match_score)
+        # Keep each decision readable on one console line; full evidence stays in JSON.
+        display_reason = ' '.join(str(reason or '').split())
+        if len(display_reason) > 200:
+            display_reason = display_reason[:200] + '…（完整原因见记录）'
         logger.info(
             f"记录: {record['result']} | "
             f"{record['company']} - {record['title']} | "
-            f"匹配 {record.get('match_score', 'N/A')}"
+            f"薪资 {record['salary'] or '未标注'} | 经验 {record['experience'] or '未标注'} | "
+            f"匹配 {score_label}" + (f" | 原因：{display_reason}" if display_reason else '')
         )
 
     def summary(self) -> dict:
@@ -186,7 +193,7 @@ class ApplyRecorder:
             },
             str(self.json_path),
         )
-        logger.info(f"详细记录已保存: {self.json_path}")
+        logger.debug(f"详细记录已保存: {self.json_path}")
 
     def is_already_processed(self, job_url: str) -> bool:
         """检查某个岗位 URL 是否已经处理过（成功投递/已跳过）"""

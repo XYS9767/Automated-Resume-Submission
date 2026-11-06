@@ -102,3 +102,14 @@ runtime:
   max_consecutive_failures: 5
   recovery_cooldown: 30
   recovery_rounds: 2
+safety:
+  paused: false
+  min_interval_seconds: 45
+  max_actions_per_run: 200
+  max_actions_per_day: 2000
+  max_detail_failures: 2
+  state_file: access_state.json
+cache:
+  file: evaluation_cache.json
+  detail_ttl_seconds: 3600
+  rejection_ttl_seconds: 86400

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 from DrissionPage import Chromium
+from access_safety import AccessGuard, AccessStopped
 from utils import clean_text, random_delay, extract_salary_range, get_logger
 from relevance import keyword_matches, contains_term, normalize, is_skill_label
 
@@ -79,48 +80,10 @@ def wait_for_job_cards(tab, timeout: float = 12.0) -> bool:
 
 
 def is_boss_security_page(tab, strict: bool = False) -> bool:
-    """是否处于 BOSS 安全验证页。
-
-    注意：普通职位页正文也可能出现「验证码」字样，不能单靠文案误判。
-    验证路由、可见验证控件或明确验证文案才表示仍需验证。
-    登录成功后可能保留 _security_check 查询参数，不能单独据此阻塞。
-    """
+    """Use the same visible-page evidence as the access guard."""
+    from access_safety import page_access_status
     try:
-        url = (tab.url or "").lower()
-        # 只检查当前路由，不把查询参数中的历史验证地址当成当前页面。
-        path = urlsplit(url).path
-        if any(k in path for k in (
-            "security.html",
-            "/web/passport/zp/security", "/captcha", "antispam",
-        )):
-            return True
-
-        if tab.run_js("""
-            return [...document.querySelectorAll(
-                'iframe[src*="captcha"], iframe[src*="security"], .geetest_panel, .nc-container'
-            )].some(e => { const r=e.getBoundingClientRect(); return r.width > 20 && r.height > 20 && getComputedStyle(e).visibility !== 'hidden'; });
-        """):
-            return True
-
-        # 首页/城市站不要当成验证页
-        if "web/geek" not in url and "security" not in url and "passport" not in url:
-            return False
-
-        body = tab.run_js(
-            "return document.body? document.body.innerText.slice(0,2500) : ''"
-        ) or ""
-
-        # 明确滑块/人机验证界面（需同时像验证页，避免误伤）
-        hard_markers = ("请完成安全验证", "滑动验证", "拖动滑块", "人机验证", "请完成验证后继续")
-        if any(k in body for k in hard_markers):
-            return True
-
-        if strict:
-            return False
-
-        # 职位页长时间骨架且无卡片：可能是风控，也可能只是慢加载
-        # 这里返回 False，由 wait_for_job_cards / 用户确认处理
-        return False
+        return bool(page_access_status(tab)[0])
     except Exception:
         return False
 
@@ -393,6 +356,9 @@ class JobSearcher:
     def __init__(self, browser: Chromium, config: dict):
         self.browser = browser
         self.cfg = config
+        self.guard = AccessGuard(config)
+        from evaluation_cache import EvaluationCache
+        self.cache = EvaluationCache(config)
         search_cfg = config["search"]
         self.keywords = search_cfg.get("keywords", ["嵌入式"])
         self.city = search_cfg.get("city", "杭州")
@@ -409,6 +375,7 @@ class JobSearcher:
         self.capture_reason = ''
         self.capture_has_more = None
         self.capture_page = 0
+        self.partial_jobs = []
 
     def build_search_url(self, keyword):
         params = {'query': keyword, 'city': self.city_code}
@@ -467,6 +434,7 @@ class JobSearcher:
         """)
 
     def advance_page(self, tab):
+        self.guard.before("search_page", tab)
         for selector in ('css:.options-pages a.next', 'css:.pagination .next',
                          'css:button[aria-label="下一页"]', 'css:a[rel="next"]'):
             button = tab.ele(selector, timeout=0)
@@ -484,6 +452,7 @@ class JobSearcher:
         self.capture_reason = ''
         self.capture_has_more = None
         self.capture_page = 0
+        self.partial_jobs = []
         tab.listen.start(['/wapi/zpgeek/search/', '/wapi/zpgeek/pc/search/'])
         enable_durable_responses(tab.listen)
 
@@ -538,6 +507,9 @@ class JobSearcher:
                             self.capture_reason = '搜索响应结构异常'
                             continue
                         code = str(data.get('code', ''))
+                        message = str(data.get('message') or data.get('msg') or '')
+                        if code == '37' or any(x in message for x in ('频繁', '限制访问', '异常行为', '安全验证')):
+                            self.guard.stop('搜索接口提示访问异常或安全验证，停止本次运行；请手动核实后重新启动。')
                         if code != '0':
                             self.capture_status = {'37': 'security', '7': 'login', '101': 'login'}.get(code, 'error')
                             self.capture_reason = '搜索接口返回 code=' + code
@@ -572,6 +544,7 @@ class JobSearcher:
         self.start_capture(tab)
         empty_rounds = 0
         try:
+            self.guard.before("search", tab)
             if not trigger(tab, keyword, self):
                 status, reason = self.capture_status, self.capture_reason
                 # A search response may arrive just before a redirect to home/login.
@@ -579,6 +552,7 @@ class JobSearcher:
                 if self.capture_status not in ('security', 'login', 'error'):
                     self.capture_status, self.capture_reason = status, reason
                 return []
+            self.guard.inspect(tab)
             for page in range(self.page_limit):
                 # Read the captured response before inspecting a redirected page.
                 batch = self.wait_capture(tab, keyword)
@@ -601,6 +575,7 @@ class JobSearcher:
                         continue
                     results[key] = job
                     added += 1
+                self.partial_jobs = list(results.values())
                 logger.info('搜索「%s」第%d轮: +%d，累计%d', keyword, page+1, added, len(results))
                 empty_rounds = 0 if added else empty_rounds + 1
                 if self.capture_has_more is False or empty_rounds >= 2 or page+1 >= self.page_limit:
@@ -627,11 +602,7 @@ class JobSearcher:
                 break
             logger.info('搜索尚未完成：%s', self.capture_reason or self.capture_status)
             if self.capture_status in ('security', 'login'):
-                # Homepage is a valid recovery state, but is never a search result.
-                # Reissue the full keyword/city automatically after it becomes stable.
-                if not wait_user_clear_security(tab, logger,
-                        timeout=self.cfg.get('runtime', {}).get('security_wait_seconds', 180)):
-                    break
+                self.guard.stop('搜索遇到登录或安全验证，停止本次运行；请手动核实后重新启动。')
             else:
                 time.sleep(self.cfg.get('runtime', {}).get('search_retry_delay', 5))
             logger.info('自动重新搜索「%s」，城市 %s（恢复重试 1/1）', keyword, self.city)
@@ -776,6 +747,8 @@ class JobSearcher:
         need_boss_status: bool = True,
     ) -> str:
         """打开职位详情页，按需抓取描述与 BOSS 状态"""
+        if self.cache.restore_detail(job):
+            return job.description
         has_desc = bool(job.description and len(job.description) >= 30)
         has_boss = (
             job.boss_online is True
@@ -793,12 +766,18 @@ class JobSearcher:
         page_for_parse = None
         try:
             detail_tab = self.ensure_detail_tab()
+            self.guard.inspect(detail_tab)
             if not self._page_is_job_detail(detail_tab, job):
+                self.guard.before("detail", detail_tab)
                 detail_tab.get(job_url)
                 detail_tab.wait(1)
+            self.guard.inspect(detail_tab)
             if not self._page_is_job_detail(detail_tab, job):
+                self.guard.detail_failed()
+                job.detail_unverified = True
                 logger.warning('详情身份未确认，保留列表资料: %s', job.title)
                 return job.description if has_desc else ''
+            job.detail_unverified = False
             page_for_parse = detail_tab
 
             if need_boss_status and page_for_parse:
@@ -810,6 +789,7 @@ class JobSearcher:
 
             page = page_for_parse
             if not need_description or has_desc:
+                self.guard.detail_ok()
                 if job.boss_active_time or job.boss_online is True:
                     logger.info(
                         f"  👤 {job.title[:20]} BOSS="
@@ -873,15 +853,19 @@ class JobSearcher:
                     pass
 
             if desc and len(desc) >= 30:
+                self.guard.detail_ok()
                 job.description = desc
+                self.cache.save_detail(job)
                 logger.info(f"  📝 {job.title[:20]} ({len(desc)}字)")
-            elif job.boss_active_time or job.boss_online is True:
-                logger.info(
-                    f"  👤 {job.title[:20]} BOSS="
-                    f"{'在线' if job.boss_online else job.boss_active_time or '未知'}"
-                )
+            else:
+                job.detail_unverified = True
+                self.guard.detail_failed()
             return desc if desc and len(desc) >= 30 else ""
+        except AccessStopped:
+            raise
         except Exception as e:
+            self.guard.detail_failed()
+            job.detail_unverified = True
             logger.warning(f"  详情获取失败 {job.title[:20]}: {e}")
             return ""
         finally:
